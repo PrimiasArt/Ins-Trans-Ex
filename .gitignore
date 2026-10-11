@@ -1,0 +1,21 @@
+# Archives
+*.rar
+*.zip
+*.7z
+*.tar.gz
+
+# OS generated files
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+.DS_Store
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

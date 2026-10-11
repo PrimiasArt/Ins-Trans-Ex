@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<title>Instagram Live Translator with Phyll♥</title>
+<script src="theme.js"></script>
+<link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">
+      <span class="dot"></span>
+      Instagram Live Translator with Phyll ♥
+    </div>
+    <div class="topbar-actions">
+      <button id="historyBtn" class="icon-btn" title="Xem lịch sử dịch">🕘</button>
+      <button id="reloadBtn" class="icon-btn" title="Xoá khung chat hiện tại (không ảnh hưởng lịch sử)">⟳</button>
+      <button id="openSettings" class="icon-btn" title="Cài đặt">⚙</button>
+    </div>
+  </header>
+
+  <div id="statusBar" class="status-bar hidden"></div>
+
+  <main class="feed" id="feed">
+    <div class="empty-state" id="emptyState">
+      Mở một hội thoại trên Instagram Direct.<br />
+      Bôi đen tin nhắn (hoặc chuột phải vào ảnh) → chuột phải → Dịch.<br />
+      Hoặc copy tin nhắn / ảnh rồi bấm <b>📋 Dán &amp; dịch</b> bên dưới.
+    </div>
+  </main>
+
+  <div id="historyOverlay" class="history-overlay hidden">
+    <div class="history-header">
+      <span>Lịch sử dịch</span>
+      <div class="history-header-actions">
+        <button id="clearHistoryBtn" class="btn small danger">Xoá lịch sử</button>
+        <button id="closeHistoryBtn" class="btn small">Đóng</button>
+      </div>
+    </div>
+    <div id="historyList" class="history-list"></div>
+  </div>
+
+  <section class="composer">
+    <div class="composer-tools">
+      <button id="pasteTranslateBtn" class="btn small" title="Dịch nội dung đang có trong clipboard: chữ hoặc ảnh (ảnh chụp màn hình, Sao chép hình ảnh...)">📋 Dán &amp; dịch</button>
+      <button id="imageBtn" class="btn small" title="Dịch chữ trong ảnh (hoặc dán ảnh Ctrl+V vào ô soạn tin)">📸 Dịch ảnh</button>
+      <input id="imageInput" type="file" accept="image/*" hidden />
+      <select id="personaSelect" class="persona-select" title="Văn phong dịch"></select>
+    </div>
+    <div class="composer-row">
+      <textarea
+        id="composeInput"
+        placeholder="Gõ tin nhắn... Enter: dịch · Ctrl+Enter: dịch &amp; chèn · Shift+Enter: xuống dòng"
+        rows="2"
+      ></textarea>
+    </div>
+    <div class="composer-actions">
+      <div class="target-lang-quick">
+        <span class="target-lang-label">Dịch sang:</span>
+        <div id="outgoingLangQuickSelect" class="lang-select-compact"></div>
+      </div>
+      <div class="btn-group">
+        <button id="translateBtn" class="btn primary">Dịch</button>
+      </div>
+    </div>
+    <div id="outgoingResult" class="outgoing-result hidden">
+      <div class="outgoing-text" id="outgoingText"></div>
+      <div class="phonetics hidden" id="outgoingPhonetics"></div>
+      <div class="outgoing-actions">
+        <button id="speakOutgoingBtn" class="btn small" title="Đọc to bản dịch">🔊</button>
+        <button id="variantsBtn" class="btn small" title="Gợi ý 3 phong cách: thân mật / trang trọng / súc tích">🎨 Phong cách</button>
+        <button id="copyBtn" class="btn small">Copy</button>
+        <button id="insertBtn" class="btn small primary">Chèn vào khung chat</button>
+      </div>
+      <div id="variantsPanel" class="suggestions-panel hidden"></div>
+    </div>
+  </section>
+
+  <script src="langselect.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>
