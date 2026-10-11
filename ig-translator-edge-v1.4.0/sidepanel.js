@@ -18,6 +18,9 @@ const historyOverlayEl = document.getElementById("historyOverlay");
 const historyListEl = document.getElementById("historyList");
 const closeHistoryBtn = document.getElementById("closeHistoryBtn");
 const clearHistoryBtn = document.getElementById("clearHistoryBtn");
+const exportHistoryBtn = document.getElementById("exportHistoryBtn");
+const importHistoryBtn = document.getElementById("importHistoryBtn");
+const importHistoryInput = document.getElementById("importHistoryInput");
 const pasteTranslateBtn = document.getElementById("pasteTranslateBtn");
 const imageBtn = document.getElementById("imageBtn");
 const imageInputEl = document.getElementById("imageInput");
@@ -419,6 +422,60 @@ clearHistoryBtn.addEventListener("click", async () => {
   await chrome.storage.local.set({ [FEED_CLEARED_KEY]: 0 });
   await renderHistoryOverlay();
   clearFeedUi();
+});
+
+exportHistoryBtn.addEventListener("click", async () => {
+  const store = await chrome.storage.local.get({ [HISTORY_KEY]: [] });
+  const items = store[HISTORY_KEY] || [];
+  if (!items.length) {
+    alert("Chưa có lịch sử dịch để xuất.");
+    return;
+  }
+  const blob = new Blob([JSON.stringify(items, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `igt_history_${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+importHistoryBtn.addEventListener("click", () => {
+  importHistoryInput.click();
+});
+
+importHistoryInput.addEventListener("change", async () => {
+  const file = importHistoryInput.files?.[0];
+  importHistoryInput.value = "";
+  if (!file) return;
+
+  try {
+    const text = await file.text();
+    let data = JSON.parse(text);
+    if (data && !Array.isArray(data) && Array.isArray(data.igt_history)) {
+      data = data.igt_history;
+    }
+    if (!Array.isArray(data)) {
+      throw new Error("File JSON không hợp lệ (cần là mảng chứa lịch sử dịch).");
+    }
+
+    const res = await chrome.runtime.sendMessage({
+      type: "IMPORT_HISTORY",
+      items: data,
+    });
+
+    if (res?.ok) {
+      await renderHistoryOverlay();
+      await loadFeedFromHistory();
+      showStatus(`Đã nhập thành công ${res.count || data.length} mục lịch sử!`);
+    } else {
+      throw new Error(res?.error || "Không thể nhập lịch sử.");
+    }
+  } catch (err) {
+    alert("Lỗi khi nhập lịch sử: " + err.message);
+  }
 });
 
 // Reload = chỉ xoá khung chat đang hiển thị, KHÔNG đụng tới lịch sử đã lưu.

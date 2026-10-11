@@ -33,7 +33,10 @@
     <div class="history-header">
       <span>Lịch sử dịch</span>
       <div class="history-header-actions">
-        <button id="clearHistoryBtn" class="btn small danger">Xoá lịch sử</button>
+        <button id="exportHistoryBtn" class="btn small" title="Xuất toàn bộ lịch sử ra file JSON để lưu trữ hoặc chuyển sang máy khác">📤 Xuất</button>
+        <button id="importHistoryBtn" class="btn small" title="Nhập lịch sử từ file JSON hoặc dán dữ liệu từ bản cũ">📥 Nhập</button>
+        <input id="importHistoryInput" type="file" accept=".json" hidden />
+        <button id="clearHistoryBtn" class="btn small danger" title="Xoá toàn bộ lịch sử">Xoá</button>
         <button id="closeHistoryBtn" class="btn small">Đóng</button>
       </div>
     </div>

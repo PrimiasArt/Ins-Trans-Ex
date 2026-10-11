@@ -34,37 +34,33 @@ const DEFAULT_SETTINGS = {
 
 const PERSONA_PROMPTS = {
   casual:
-    "Use a natural, friendly, warm conversational tone suitable for close friends or peers. In Vietnamese, naturally use pronouns like 'mình - bạn', 'cậu - tớ', or 'anh - em'. Avoid stiff dictionary words.",
+    "Use a deeply sweet, warm, affectionate, and loving tone. In Vietnamese, naturally use tender romantic pronouns (anh - em / em - anh), speaking with warmth, adoration, tenderness and caring affection.",
   formal:
     "Use a courteous, polite, and respectful tone with proper honorifics, suitable for business inquiries, customer support, or formal interactions.",
   genz:
-    "Use modern, trendy Gen Z internet slang, abbreviations, and informal phrasing (e.g. English: tbh, rn, fr, idk, lol; Vietnamese: chòi oi, u là trời, k/ko, đc, xịn xò...). Keep it playful and fun.",
+    "Use modern, cute, playful Gen Z internet slang, cute expressions, and emojis (e.g. English: tbh, rn, cutie, lol, slay; Vietnamese: chòi oi, u là trời, iu xỉu, xịn xò, kkk...). Keep it playful, sweet and adorable.",
   tech:
     "Use accurate software/tech terminology while maintaining a clean, concise, direct chat style.",
 };
 
-const CHAT_SYSTEM_INSTRUCTION = `You are a professional, ultra-fast real-time chat translation engine specialized in social media messaging (Instagram Direct DMs).
+const CHAT_SYSTEM_INSTRUCTION = `You are a sweet, caring, ultra-fast real-time chat translation engine specialized in intimate, affectionate social media messaging (Instagram Direct DMs with Phyll ♥).
 
-CRITICAL TRANSLATION QUALITY GUIDELINES:
-1. AUTHENTIC SOCIAL CHAT REGISTER:
-   - Always translate into natural, authentic everyday conversational messaging style as real native speakers actually text on Instagram.
-   - NEVER use robotic, stiff, or overly formal textbook translations (unless "formal" style is explicitly set).
-   - Accurately interpret internet abbreviations, slang, colloquialisms, and casual phrasing:
-     * English: idk, tbh, rn, ngl, fr, lmao, lol, hru, wbu, gtg, brb, omw, afaik, slay, sus...
-     * Vietnamese: k/ko (không), đc/dc (được), ntn (như thế nào), rep (trả lời), ib (nhắn tin/inbox), fl (follow), tym (thả tim), sao z/sao dạ, chòi oi/u là trời, b/mình, c/tớ, mn (mọi người), vcl, kkk...
+CRITICAL TRANSLATION QUALITY & ROMANTIC TONE GUIDELINES:
+1. SWEET, LOVING & TENDER TONE (NGỌT NGÀO, TÌNH CẢM, ÂU YẾM):
+   - Always translate with genuine emotional warmth, tenderness, and sweetness (giọng điệu ngọt ngào, dịu dàng, ấm áp, đáng yêu, quan tâm, cưng nựng).
+   - In Vietnamese: DEFAULT to sweet, affectionate couple pronouns ("anh - em" / "em - anh") or loving terms of endearment (cưng, người iu, bé, thương thương...), unless formal style is explicitly requested.
+   - NEVER use cold, stiff, textbook-like pronouns ("Tôi - Bạn" or impersonal words).
+   - Compliments, flirtatious banter, loving expressions, and caring check-ins must sound authentically sweet and heart-warming.
+2. COLLOQUIAL SOCIAL CHAT REGISTER:
+   - Accurately decode internet abbreviations, emotional slang, cute chat particles:
+     * English: idk, tbh, rn, ngl, fr, lmao, lol, hru, wbu, gtg, brb, miss u, love u, sweet dreams, cutie, babe...
+     * Vietnamese: k/ko (không), đc/dc (được), ntn (như thế nào), rep (trả lời), ib (inbox), fl, tym, sao z/sao dạ, chòi oi, nhớ anh/em, thương, iu, ngoan, kkk...
      * Asian languages: common chat particles and internet slang in Japanese, Korean, Chinese.
-2. VIETNAMESE PRONOUN & LOCALIZATION RULES:
-   - When translating INTO Vietnamese:
-     * Avoid dry/rigid pronouns like "Tôi - Bạn" unless in formal business settings.
-     * Naturally use friendly chat pronouns ("mình - bạn", "cậu - tớ", or "anh - em" depending on intimacy, context, or persona).
-     * Translate feelings and idioms naturally (e.g. "That's cool!" -> "Xịn xò thế!", "Hay quá nè!").
-   - When translating FROM Vietnamese:
-     * Fully decode Vietnamese abbreviations/slang and translate into colloquial, native-sounding expressions in the target language.
-3. CONTEXT & PRESERVATION:
-   - Keep all emojis (❤️, 😂, ✨...), emoticons (:)), @mentions, #hashtags, URLs, and emotional punctuation ("???", "!!!", "~~") in place.
-   - Maintain tone consistency with preceding conversation turns. DO NOT re-translate or repeat previous turns.
-   - Focus on conveying the exact nuance, emotion, and intention.
-4. STRICT COMPLIANCE:
+3. CONTEXT & PRONOUN REVERSAL:
+   - Check the RECENT CONVERSATION HISTORY turns to identify who is "anh" and who is "em", and consistently preserve the established pronouns and intimacy.
+   - Retain all emojis (❤️, 🥰, 🥺, 💕, ✨, 😘...), stickers, @usernames, and emotional punctuation (~~, !!!, ???).
+   - DO NOT re-translate previous turns.
+4. STRICT DIRECT OUTPUT:
    - Output ONLY the requested JSON schema without any conversational pleasantries, markdown tags, or commentary outside the JSON.`;
 
 const CONTEXT_MENU_ID = "igt-translate-selection";
@@ -822,6 +818,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
           TRANSLATION_CACHE.clear();
           sendResponse({ ok: true });
+          break;
+        }
+
+        case "EXPORT_HISTORY": {
+          const store = await chrome.storage.local.get({ [HISTORY_KEY]: [] });
+          sendResponse({ ok: true, items: store[HISTORY_KEY] || [] });
+          break;
+        }
+
+        case "IMPORT_HISTORY": {
+          const items = Array.isArray(message.items) ? message.items : [];
+          if (items.length) {
+            await withHistory((list) => {
+              const existingIds = new Set(list.map((it) => it.id));
+              for (const item of items) {
+                if (item && item.original && item.translation) {
+                  if (!item.id || existingIds.has(item.id)) {
+                    item.id = newId(item.kind === "outgoing" ? "out" : "in");
+                  }
+                  list.push(item);
+                  existingIds.add(item.id);
+                }
+              }
+              list.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+              if (list.length > MAX_HISTORY_ITEMS) {
+                list.splice(0, list.length - MAX_HISTORY_ITEMS);
+              }
+            });
+            TRANSLATION_CACHE.clear();
+          }
+          sendResponse({ ok: true, count: items.length });
           break;
         }
 
