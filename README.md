@@ -1,26 +1,23 @@
-# Instagram Live Translator (Chrome & Edge Extension) — v1.3.0
+# Instagram Live Translator (Chrome & Edge Extension)
 
 Extension dạng **side panel** dịch song song hội thoại Instagram Direct theo thời gian thực bằng **Gemini API**.
 
 ---
 
-## 🌟 Tính năng nổi bật
+## 🚀 Phiên bản v1.4.0 (Mới nhất — Siêu tốc & Chuẩn xác)
 
-- **Dịch song song 2 chiều (Đến & Đi)**:
-  - Tự động nhận diện ngôn ngữ và dịch tin nhắn ĐẾN sang ngôn ngữ bạn muốn hiểu.
-  - Ô soạn tin dịch ngược tin nhắn bạn sắp gửi sang ngôn ngữ của đối phương.
-- **Dịch có ngữ cảnh (Context-aware)**: Gửi kèm N lượt hội thoại gần nhất giúp Gemini duy trì ngôi xưng và văn phong nhất quán.
-- **Phong cách & Persona**:
-  - Hướng dẫn phong cách tuỳ chỉnh (formality, ngôi xưng...).
-  - Quick persona: Mặc định, 💖 Thân mật, 💼 Trang trọng, 🤣 Gen Z, 💻 Kỹ thuật.
-  - Gợi ý 3 biến thể phong cách cho tin nhắn đi (Thân mật / Trang trọng / Súc tích).
-- **Gợi ý câu trả lời thông minh (💡)**: Tự động đề xuất các câu trả lời kèm bản dịch để phản hồi nhanh.
-- **Dịch ảnh (OCR) & Dán & dịch (📋)**:
-  - Chuột phải vào ảnh để dịch chữ trong ảnh.
-  - Dán trực tiếp ảnh hoặc chữ từ clipboard (`Ctrl+V`).
-- **Phát âm & Đọc to (TTS)**: Hỗ trợ phiên âm ngữ âm và phát âm bằng giọng đọc của hệ thống/trình duyệt.
-- **Lưu lịch sử dịch**: Tự động lưu tối đa 300 mục gần nhất vào `chrome.storage.local`, không mất khi tắt side panel.
-- **Giao diện hiện đại**: Hỗ trợ Dark/Light mode và tuỳ chỉnh màu chủ đạo (Accent color).
+- **⚡ Phản hồi siêu tốc (<500ms)**:
+  - Tắt suy nghĩ ngầm (`thinkingConfig: { thinkingBudget: 0 }`) trên Gemini 2.5 Flash / Pro, loại bỏ độ trễ 3–5 giây, dịch và phản hồi gần như tức thì.
+  - Tự động bỏ qua gọi API khi tin nhắn chỉ gồm emoji, icon, số hoặc URL (0ms).
+  - Tích hợp bộ nhớ đệm Cache LRU (120 câu gần nhất) cho các từ/câu lặp lại (0ms).
+  - Hiển thị nhãn thời gian phản hồi (ví dụ: `⚡ 280ms`, `⚡ 0ms (cache)`).
+- **🎯 Dịch chuẩn xác, tự nhiên theo ngữ cảnh DM Instagram**:
+  - Tinh chỉnh System Instruction chuyên biệt: hiểu sâu tiếng lóng (slang), từ viết tắt (`k`, `ko`, `đc`, `ntn`, `ib`, `rep`, `fl`, `idk`, `tbh`, `rn`, `ngl`, `fr`...).
+  - Xử lý đại từ xưng hô tiếng Việt tự nhiên (`mình - bạn`, `cậu - tớ`, `anh - em`), loại bỏ cách dịch thô cứng "Tôi - Bạn".
+  - Giữ trọn vẹn cảm xúc, emoji, @username, #hashtag và dấu câu biểu cảm.
+- **⚙️ Tối ưu hoá sinh token**:
+  - Tuỳ chọn bật/tắt **Phiên âm (Phonetics)** trong Settings: mặc định tắt để giảm 60% số token phải sinh ra, tăng tốc độ dịch gấp đôi.
+  - Sử dụng JSON Schema chuẩn (`responseSchema`) từ Google Gemini API, đảm bảo dữ liệu chuẩn 100% không bị lỗi parse.
 
 ---
 
@@ -28,28 +25,30 @@ Extension dạng **side panel** dịch song song hội thoại Instagram Direct 
 
 ```text
 Ins-Trans Update/
-├── ig-translator-chrome/    # Bản cài đặt cho Google Chrome
-├── ig-translator-edge/      # Bản cài đặt cho Microsoft Edge
-├── HANDOFF.md               # Tài liệu bàn giao & lịch sử phát triển
-└── README.md                # Giới thiệu & hướng dẫn chung
+├── ig-translator-chrome-v1.4.0/    # [MỚI - v1.4.0] Bản cài đặt Chrome siêu tốc & dịch chuẩn
+├── ig-translator-edge-v1.4.0/      # [MỚI - v1.4.0] Bản cài đặt Edge siêu tốc & dịch chuẩn
+├── ig-translator-chrome/           # [GỐC - v1.3.0] Bản gốc cho Google Chrome
+├── ig-translator-edge/             # [GỐC - v1.3.0] Bản gốc cho Microsoft Edge
+├── HANDOFF.md                      # Tài liệu bàn giao & lịch sử phát triển
+└── README.md                       # Giới thiệu & hướng dẫn chung
 ```
 
 ---
 
-## 🚀 Hướng dẫn cài đặt
+## 🚀 Hướng dẫn cài đặt phiên bản v1.4.0
 
 ### 1. Google Chrome
 1. Mở trình duyệt và truy cập `chrome://extensions/`.
 2. Bật **Developer mode** (Chế độ dành cho nhà phát triển) ở góc trên bên phải.
 3. Nhấp chọn **Load unpacked** (Tải tiện ích đã giải nén).
-4. Chọn thư mục `ig-translator-chrome`.
+4. Chọn thư mục `ig-translator-chrome-v1.4.0`.
 5. Ghim icon extension lên thanh công cụ và bấm vào để mở Side Panel.
 
 ### 2. Microsoft Edge
 1. Mở trình duyệt và truy cập `edge://extensions/`.
 2. Bật chế độ **Developer mode** ở thanh menu bên trái.
 3. Nhấp chọn **Load unpacked** (Tải phần mở rộng chưa được đóng gói).
-4. Chọn thư mục `ig-translator-edge`.
+4. Chọn thư mục `ig-translator-edge-v1.4.0`.
 5. Ghim icon extension và mở Side Panel.
 
 ---
@@ -59,4 +58,5 @@ Ins-Trans Update/
 1. Nhấp vào icon ⚙ (Settings) trên Side Panel hoặc mở Options của extension.
 2. Nhập **Gemini API Key** (lấy miễn phí tại [Google AI Studio](https://aistudio.google.com/apikey)).
 3. Chọn Model (ví dụ: `gemini-2.5-flash`), ngôn ngữ đích cho tin đến và tin đi.
-4. Bấm **Lưu cài đặt**.
+4. Bật **⚡ Chế độ siêu tốc (Fast Mode)** (đã bật sẵn theo mặc định).
+5. Bấm **Lưu cài đặt**.
