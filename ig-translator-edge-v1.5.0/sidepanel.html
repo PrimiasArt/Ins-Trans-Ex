@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<title>Instagram Live Translator with Phyll♥</title>
+<script src="theme.js"></script>
+<link rel="stylesheet" href="sidepanel.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">
+      <span class="dot"></span>
+      Instagram Live Translator with Phyll ♥
+    </div>
+    <div class="topbar-actions">
+      <button id="syncBtn" class="icon-btn" title="Đồng bộ Lịch sử &amp; Thư viện từ với Cloudflare ngay">☁️</button>
+      <button id="libraryBtn" class="icon-btn" title="Thư viện từ &amp; Bộ nhớ dịch 0ms">📚</button>
+      <button id="historyBtn" class="icon-btn" title="Xem lịch sử dịch">🕘</button>
+      <button id="reloadBtn" class="icon-btn" title="Xoá khung chat hiện tại (không ảnh hưởng lịch sử)">⟳</button>
+      <button id="openSettings" class="icon-btn" title="Cài đặt">⚙</button>
+    </div>
+  </header>
+
+  <div id="statusBar" class="status-bar hidden"></div>
+
+  <main class="feed" id="feed">
+    <div class="empty-state" id="emptyState">
+      Mở một hội thoại trên Instagram Direct.<br />
+      Bôi đen tin nhắn (hoặc chuột phải vào ảnh) → chuột phải → Dịch.<br />
+      Hoặc copy tin nhắn / ảnh rồi bấm <b>📋 Dán &amp; dịch</b> bên dưới.
+    </div>
+  </main>
+
+  <div id="libraryOverlay" class="history-overlay hidden">
+    <div class="history-header">
+      <span>📚 Thư viện từ &amp; Bộ nhớ</span>
+      <div class="history-header-actions">
+        <button id="exportLibraryBtn" class="btn small" title="Xuất Thư viện từ ra file JSON">📤 Xuất</button>
+        <button id="importLibraryBtn" class="btn small" title="Nhập Thư viện từ từ file JSON">📥 Nhập</button>
+        <input id="importLibraryInput" type="file" accept=".json" hidden />
+        <button id="closeLibraryBtn" class="btn small">Đóng</button>
+      </div>
+    </div>
+
+    <div class="library-stats">
+      <div class="stat-pill" title="Số từ/câu bạn đã ghim cố định">📌 Từ điển: <b id="statGlossaryCount">0</b></div>
+      <div class="stat-pill" title="Số mẫu câu tự động học từ lịch sử &amp; hội thoại">🧠 Bộ nhớ: <b id="statTmCount">0</b></div>
+      <div class="stat-pill highlight" title="Số lượt gọi Gemini API đã tiết kiệm được (phản hồi 0ms)">⚡ Tiết kiệm: <b id="statSavedCalls">0</b> API</div>
+    </div>
+
+    <div class="library-tabs">
+      <button id="tabGlossaryBtn" class="lib-tab active">📌 Từ điển &amp; Câu ghim</button>
+      <button id="tabTmBtn" class="lib-tab">🧠 Bộ nhớ tự động</button>
+    </div>
+
+    <div id="glossaryAddBox" class="library-add-box">
+      <div class="lib-input-row">
+        <input id="glossarySourceInput" type="text" placeholder="Từ / câu gốc (VD: กินข้าวยัง, Phyll, babe...)" />
+        <input id="glossaryTargetInput" type="text" placeholder="Nghĩa / bản dịch cố định (VD: Em ăn cơm chưa đó?...)" />
+      </div>
+      <div class="lib-action-row">
+        <select id="glossaryDirectionSelect" class="persona-select" style="margin-left:0; max-width:none;">
+          <option value="any">↔ Áp dụng cả 2 chiều</option>
+          <option value="incoming">📥 Chỉ tin đến (→ Việt)</option>
+          <option value="outgoing">📤 Chỉ tin đi (Việt →)</option>
+        </select>
+        <button id="addGlossaryBtn" class="btn small primary">+ Lưu vào từ điển</button>
+      </div>
+    </div>
+
+    <div class="library-search-bar">
+      <input id="librarySearchInput" type="text" placeholder="🔍 Tìm kiếm từ vựng hoặc mẫu câu..." />
+      <button id="clearTmBtn" class="btn small danger hidden" title="Xoá toàn bộ bộ nhớ tự động">Xoá bộ nhớ</button>
+    </div>
+
+    <div id="libraryList" class="history-list"></div>
+  </div>
+
+  <div id="historyOverlay" class="history-overlay hidden">
+    <div class="history-header">
+      <span>Lịch sử dịch</span>
+      <div class="history-header-actions">
+        <button id="exportHistoryBtn" class="btn small" title="Xuất toàn bộ lịch sử ra file JSON để lưu trữ hoặc chuyển sang máy khác">📤 Xuất</button>
+        <button id="importHistoryBtn" class="btn small" title="Nhập lịch sử từ file JSON hoặc dán dữ liệu từ bản cũ">📥 Nhập</button>
+        <input id="importHistoryInput" type="file" accept=".json" hidden />
+        <button id="clearHistoryBtn" class="btn small danger" title="Xoá toàn bộ lịch sử">Xoá</button>
+        <button id="closeHistoryBtn" class="btn small">Đóng</button>
+      </div>
+    </div>
+    <div id="historyList" class="history-list"></div>
+  </div>
+
+  <section class="composer">
+    <div class="composer-tools">
+      <button id="pasteTranslateBtn" class="btn small" title="Dịch nội dung đang có trong clipboard: chữ hoặc ảnh (ảnh chụp màn hình, Sao chép hình ảnh...)">📋 Dán &amp; dịch</button>
+      <button id="imageBtn" class="btn small" title="Dịch chữ trong ảnh (hoặc dán ảnh Ctrl+V vào ô soạn tin)">📸 Dịch ảnh</button>
+      <input id="imageInput" type="file" accept="image/*" hidden />
+      <select id="personaSelect" class="persona-select" title="Văn phong dịch"></select>
+    </div>
+    <div class="composer-row">
+      <textarea
+        id="composeInput"
+        placeholder="Gõ tin nhắn... Enter: dịch · Ctrl+Enter: dịch &amp; chèn · Shift+Enter: xuống dòng"
+        rows="2"
+      ></textarea>
+    </div>
+    <div class="composer-actions">
+      <div class="target-lang-quick">
+        <span class="target-lang-label">Dịch sang:</span>
+        <div id="outgoingLangQuickSelect" class="lang-select-compact"></div>
+      </div>
+      <div class="btn-group">
+        <button id="translateBtn" class="btn primary">Dịch</button>
+      </div>
+    </div>
+    <div id="outgoingResult" class="outgoing-result hidden">
+      <div class="outgoing-text" id="outgoingText"></div>
+      <div class="phonetics hidden" id="outgoingPhonetics"></div>
+      <div class="outgoing-actions">
+        <button id="speakOutgoingBtn" class="btn small" title="Đọc to bản dịch">🔊</button>
+        <button id="pinOutgoingBtn" class="btn small" title="Ghim câu này vào Từ điển cá nhân (lần sau dịch 0ms)">📌 Lưu từ</button>
+        <button id="variantsBtn" class="btn small" title="Gợi ý 3 phong cách: thân mật / trang trọng / súc tích">🎨 Phong cách</button>
+        <button id="copyBtn" class="btn small">Copy</button>
+        <button id="insertBtn" class="btn small primary">Chèn vào khung chat</button>
+      </div>
+      <div id="variantsPanel" class="suggestions-panel hidden"></div>
+    </div>
+  </section>
+
+  <script src="langselect.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

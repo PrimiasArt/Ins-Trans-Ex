@@ -836,25 +836,43 @@ async function syncHistoryWithCloud({
     return { ok: false, skipped: true, error: "Chưa bật đồng bộ đám mây." };
   }
 
-  const workerUrl = (settings.syncWorkerUrl || "").trim().replace(/\/+$/, "");
+  let workerUrl = (settings.syncWorkerUrl || "").trim().replace(/\/+$/, "");
   const syncKey = (settings.syncKey || "").trim();
 
   if (!workerUrl) {
     if (silent) return { ok: false, skipped: true };
     throw new Error("Chưa nhập Cloudflare Worker URL.");
   }
+  if (!/^https?:\/\//i.test(workerUrl)) {
+    workerUrl = "https://" + workerUrl;
+  }
+  if (workerUrl.includes("dash.cloudflare.com")) {
+    throw new Error(
+      "Bạn đang dán link trang quản trị Cloudflare. Hãy dán link Worker có đuôi .workers.dev (VD: https://ig-trans-sync.ten-ban.workers.dev)."
+    );
+  }
   if (!syncKey || syncKey.length < 6) {
     if (silent) return { ok: false, skipped: true };
     throw new Error("Sync Key cần tối thiểu 6 ký tự.");
   }
 
+  // Mã hóa URI cho syncKey trên header để tránh lỗi Failed to fetch khi Sync Key có dấu tiếng Việt
+  const authToken = encodeURIComponent(syncKey);
+
   // 1. Kéo dữ liệu từ Cloudflare KV
-  const getRes = await fetch(workerUrl, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${syncKey}`,
-    },
-  });
+  let getRes;
+  try {
+    getRes = await fetch(workerUrl, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+      },
+    });
+  } catch (netErr) {
+    throw new Error(
+      `Không kết nối được tới ${workerUrl} (${netErr?.message || "Failed to fetch"}). Hãy kiểm tra: (1) Đã bấm Reload 🔄 extension trong chrome://extensions chưa, (2) Đã dán code worker.js & bấm Deploy trên Cloudflare chưa, (3) Link .workers.dev có viết đúng không.`
+    );
+  }
 
   if (!getRes.ok) {
     const errData = await getRes.json().catch(() => ({}));
@@ -886,14 +904,21 @@ async function syncHistoryWithCloud({
 
   // 3. Mã hóa danh sách đã gộp và đẩy ngược lên Cloud
   const encryptedPayload = await encryptHistoryPayload(finalItems, syncKey);
-  const postRes = await fetch(workerUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${syncKey}`,
-    },
-    body: JSON.stringify(encryptedPayload),
-  });
+  let postRes;
+  try {
+    postRes = await fetch(workerUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify(encryptedPayload),
+    });
+  } catch (netErr) {
+    throw new Error(
+      `Không gửi được dữ liệu lên ${workerUrl} (${netErr?.message || "Failed to fetch"}).`
+    );
+  }
 
   if (!postRes.ok) {
     const errData = await postRes.json().catch(() => ({}));
