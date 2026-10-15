@@ -27,6 +27,10 @@ const DEFAULT_SETTINGS = {
   fastMode: true,
   // Tạo phiên âm: Tắt mặc định để tăng tốc độ phản hồi gấp 2 lần. Bật khi cần.
   enablePhonetics: false,
+  // Đồng bộ lịch sử qua Cloudflare Worker + KV (Mã hóa đầu cuối AES-256)
+  syncEnabled: false,
+  syncWorkerUrl: "",
+  syncKey: "",
   // Giao diện: "system" | "light" | "dark", và màu chủ đạo (hex).
   theme: "system",
   accentColor: "#405de6",
@@ -133,6 +137,7 @@ function addHistoryItem(item) {
     if (list.length > MAX_HISTORY_ITEMS) {
       list.splice(0, list.length - MAX_HISTORY_ITEMS);
     }
+    scheduleAutoSync();
     return item;
   });
 }
@@ -141,14 +146,20 @@ function updateHistoryItem(id, patch) {
   if (!id) return Promise.resolve();
   return withHistory((list) => {
     const idx = list.findIndex((it) => it.id === id);
-    if (idx !== -1) list[idx] = { ...list[idx], ...patch };
+    if (idx !== -1) {
+      list[idx] = { ...list[idx], ...patch };
+      scheduleAutoSync();
+    }
   });
 }
 
 function deleteHistoryItem(id) {
   return withHistory((list) => {
     const idx = list.findIndex((it) => it.id === id);
-    if (idx !== -1) list.splice(idx, 1);
+    if (idx !== -1) {
+      list.splice(idx, 1);
+      scheduleAutoSync();
+    }
   });
 }
 
@@ -708,6 +719,207 @@ function parseDataUrl(dataUrl) {
   return { mimeType: m[1], data: m[2] };
 }
 
+// ---------------------------------------------------------------------------
+// Đồng bộ lịch sử qua Cloudflare Worker + KV (Mã hóa đầu cuối AES-GCM-256)
+// ---------------------------------------------------------------------------
+
+function base64ToUint8Array(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function deriveCryptoKey(syncKey) {
+  const enc = new TextEncoder();
+  const hash = await crypto.subtle.digest(
+    "SHA-256",
+    enc.encode("igt_e2e_aes256_v1:" + syncKey)
+  );
+  return crypto.subtle.importKey("raw", hash, { name: "AES-GCM" }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+}
+
+async function encryptHistoryPayload(items, syncKey) {
+  const key = await deriveCryptoKey(syncKey);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encoded = new TextEncoder().encode(JSON.stringify(items));
+  const cipherBuf = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    encoded
+  );
+  return {
+    v: 1,
+    iv: arrayBufferToBase64(iv.buffer),
+    ct: arrayBufferToBase64(cipherBuf),
+    updatedAt: Date.now(),
+  };
+}
+
+async function decryptHistoryPayload(payload, syncKey) {
+  if (!payload) return [];
+  if (Array.isArray(payload.items)) return payload.items;
+  if (!payload.ct || !payload.iv) return [];
+  const key = await deriveCryptoKey(syncKey);
+  const iv = base64ToUint8Array(payload.iv);
+  const ct = base64ToUint8Array(payload.ct);
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv },
+    key,
+    ct
+  );
+  const jsonStr = new TextDecoder().decode(plainBuf);
+  const parsed = JSON.parse(jsonStr);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function mergeHistoryLists(localList, remoteList) {
+  const bySig = new Map();
+  const sigOf = (it) =>
+    `${it.kind || "incoming"}||${(it.original || "").trim()}||${(
+      it.translation || ""
+    ).trim()}`;
+
+  const ingest = (it) => {
+    if (!it || !it.original || !it.translation) return;
+    const s = sigOf(it);
+    const existing = bySig.get(s);
+    if (!existing) {
+      bySig.set(s, { ...it });
+    } else {
+      const newer =
+        (it.timestamp || 0) >= (existing.timestamp || 0) ? it : existing;
+      const older = newer === it ? existing : it;
+      bySig.set(s, {
+        ...older,
+        ...newer,
+        suggestions: newer.suggestions?.length
+          ? newer.suggestions
+          : older.suggestions,
+      });
+    }
+  };
+
+  for (const it of remoteList || []) ingest(it);
+  for (const it of localList || []) ingest(it);
+
+  const merged = Array.from(bySig.values());
+  merged.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  if (merged.length > MAX_HISTORY_ITEMS) {
+    return merged.slice(merged.length - MAX_HISTORY_ITEMS);
+  }
+  return merged;
+}
+
+let syncDebounceTimer = null;
+function scheduleAutoSync() {
+  if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
+  syncDebounceTimer = setTimeout(() => {
+    syncHistoryWithCloud({ silent: true }).catch(() => {});
+  }, 1500);
+}
+
+async function syncHistoryWithCloud({
+  silent = false,
+  overrideConfig = null,
+} = {}) {
+  const settings = overrideConfig
+    ? { ...(await getSettings()), ...overrideConfig }
+    : await getSettings();
+
+  if (!overrideConfig && !settings.syncEnabled) {
+    return { ok: false, skipped: true, error: "Chưa bật đồng bộ đám mây." };
+  }
+
+  const workerUrl = (settings.syncWorkerUrl || "").trim().replace(/\/+$/, "");
+  const syncKey = (settings.syncKey || "").trim();
+
+  if (!workerUrl) {
+    if (silent) return { ok: false, skipped: true };
+    throw new Error("Chưa nhập Cloudflare Worker URL.");
+  }
+  if (!syncKey || syncKey.length < 6) {
+    if (silent) return { ok: false, skipped: true };
+    throw new Error("Sync Key cần tối thiểu 6 ký tự.");
+  }
+
+  // 1. Kéo dữ liệu từ Cloudflare KV
+  const getRes = await fetch(workerUrl, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${syncKey}`,
+    },
+  });
+
+  if (!getRes.ok) {
+    const errData = await getRes.json().catch(() => ({}));
+    throw new Error(
+      errData?.error || `Lỗi kết nối Cloudflare Worker (${getRes.status}).`
+    );
+  }
+
+  const remotePayload = await getRes.json();
+  let remoteItems = [];
+  if (remotePayload && !remotePayload.empty && remotePayload.ct) {
+    try {
+      remoteItems = await decryptHistoryPayload(remotePayload, syncKey);
+    } catch (e) {
+      throw new Error(
+        "Không giải mã được dữ liệu trên Cloud (sai Sync Key hoặc dữ liệu không khớp)."
+      );
+    }
+  }
+
+  // 2. Gộp hai chiều với lịch sử trên máy hiện tại
+  let finalItems = [];
+  await withHistory((localList) => {
+    const merged = mergeHistoryLists(localList, remoteItems);
+    localList.length = 0;
+    localList.push(...merged);
+    finalItems = [...merged];
+  });
+
+  // 3. Mã hóa danh sách đã gộp và đẩy ngược lên Cloud
+  const encryptedPayload = await encryptHistoryPayload(finalItems, syncKey);
+  const postRes = await fetch(workerUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${syncKey}`,
+    },
+    body: JSON.stringify(encryptedPayload),
+  });
+
+  if (!postRes.ok) {
+    const errData = await postRes.json().catch(() => ({}));
+    throw new Error(
+      errData?.error || `Lỗi lưu lên Cloudflare Worker (${postRes.status}).`
+    );
+  }
+
+  const syncedAt = Date.now();
+  await chrome.storage.local.set({ igt_last_sync_at: syncedAt });
+
+  chrome.runtime
+    .sendMessage({
+      type: "HISTORY_SYNCED",
+      count: finalItems.length,
+      syncedAt,
+    })
+    .catch(() => {});
+
+  return {
+    ok: true,
+    count: finalItems.length,
+    syncedAt,
+  };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     try {
@@ -720,6 +932,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         case "SAVE_SETTINGS": {
           await chrome.storage.sync.set(message.settings || {});
           sendResponse({ ok: true });
+          break;
+        }
+
+        case "SYNC_HISTORY_NOW": {
+          const result = await syncHistoryWithCloud({
+            silent: false,
+            overrideConfig: message.config || null,
+          });
+          sendResponse(result);
           break;
         }
 
@@ -817,6 +1038,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             list.length = 0;
           });
           TRANSLATION_CACHE.clear();
+          scheduleAutoSync();
           sendResponse({ ok: true });
           break;
         }
@@ -847,6 +1069,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               }
             });
             TRANSLATION_CACHE.clear();
+            scheduleAutoSync();
           }
           sendResponse({ ok: true, count: items.length });
           break;

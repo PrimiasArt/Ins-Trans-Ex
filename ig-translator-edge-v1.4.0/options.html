@@ -152,6 +152,48 @@
       </small>
     </label>
 
+    <hr class="divider" />
+
+    <h2 class="section-title">☁️ Đồng bộ lịch sử qua Cloudflare (E2E Encrypted)</h2>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="syncEnabled" />
+      <span>Bật tự động đồng bộ lịch sử dịch giữa các máy / trình duyệt</span>
+    </label>
+
+    <label class="field">
+      <span>Cloudflare Worker URL</span>
+      <input
+        type="text"
+        id="syncWorkerUrl"
+        placeholder="https://ig-trans-sync.<tên-bạn>.workers.dev"
+        autocomplete="off"
+      />
+      <small>
+        Đường dẫn Worker trên tài khoản Cloudflare của bạn (xem file
+        <code>cloudflare-worker/worker.js</code> trong thư mục dự án).
+      </small>
+    </label>
+
+    <label class="field">
+      <span>Khóa định danh cố định (Sync Key — tối thiểu 6 ký tự)</span>
+      <div class="model-row">
+        <input
+          type="password"
+          id="syncKey"
+          placeholder="Ví dụ: tam_phyll_love_2026"
+          autocomplete="off"
+        />
+        <button type="button" id="syncNowBtn" class="btn small">
+          🔄 Đồng bộ ngay
+        </button>
+      </div>
+      <small id="syncHint">
+        Nhập cùng một Sync Key trên mọi máy (Chrome / Edge). Dữ liệu được mã hóa
+        đầu cuối AES-256 bằng chính khóa này trước khi gửi lên Cloudflare.
+      </small>
+    </label>
+
     <button id="saveBtn" class="btn primary">Lưu cài đặt</button>
     <span id="savedMsg" class="saved-msg hidden">Đã lưu ✓</span>
   </div>

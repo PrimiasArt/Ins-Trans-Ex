@@ -12,6 +12,7 @@ const variantsPanelEl = document.getElementById("variantsPanel");
 const copyBtn = document.getElementById("copyBtn");
 const insertBtn = document.getElementById("insertBtn");
 const openSettingsBtn = document.getElementById("openSettings");
+const syncBtn = document.getElementById("syncBtn");
 const historyBtn = document.getElementById("historyBtn");
 const reloadBtn = document.getElementById("reloadBtn");
 const historyOverlayEl = document.getElementById("historyOverlay");
@@ -484,6 +485,35 @@ reloadBtn.addEventListener("click", async () => {
   clearFeedUi();
 });
 
+syncBtn?.addEventListener("click", async () => {
+  if (!currentSettings?.syncWorkerUrl || !currentSettings?.syncKey) {
+    showStatus("Chưa cấu hình Cloudflare Sync. Nhấn ⚙ để nhập Worker URL và Sync Key.", true);
+    return;
+  }
+  syncBtn.disabled = true;
+  const prev = syncBtn.textContent;
+  syncBtn.textContent = "⏳";
+  clearStatus();
+  try {
+    const res = await chrome.runtime.sendMessage({
+      type: "SYNC_HISTORY_NOW",
+      config: { syncEnabled: true },
+    });
+    if (!res?.ok) throw new Error(res?.error || "Đồng bộ thất bại.");
+    await loadFeedFromHistory();
+    if (!historyOverlayEl.classList.contains("hidden")) {
+      await renderHistoryOverlay();
+    }
+    showStatus(`☁️ Đã đồng bộ thành công ${res.count || 0} mục lịch sử!`);
+    setTimeout(() => clearStatus(), 2500);
+  } catch (err) {
+    showStatus(err.message || String(err), true);
+  } finally {
+    syncBtn.disabled = false;
+    syncBtn.textContent = prev;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Lắng nghe tin nhắn đến đã được background dịch sẵn (context menu / auto-scan)
 // ---------------------------------------------------------------------------
@@ -494,6 +524,11 @@ chrome.runtime.onMessage.addListener((message) => {
     renderCard(message.item);
   } else if (message?.type === "TRANSLATE_ERROR") {
     showStatus(message.error || "Dịch thất bại.", true);
+  } else if (message?.type === "HISTORY_SYNCED") {
+    loadFeedFromHistory();
+    if (!historyOverlayEl.classList.contains("hidden")) {
+      renderHistoryOverlay();
+    }
   }
 });
 
@@ -745,5 +780,9 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 });
 
 initPersonaSelect();
-loadSettings();
+loadSettings().then(() => {
+  if (currentSettings?.syncEnabled && currentSettings?.syncWorkerUrl && currentSettings?.syncKey) {
+    chrome.runtime.sendMessage({ type: "SYNC_HISTORY_NOW" }).catch(() => {});
+  }
+});
 loadFeedFromHistory();

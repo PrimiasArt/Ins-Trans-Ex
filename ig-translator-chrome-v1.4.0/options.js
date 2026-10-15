@@ -14,9 +14,21 @@ const els = {
   accentColor: document.getElementById("accentColor"),
   accentPresets: document.getElementById("accentPresets"),
   resetAccentBtn: document.getElementById("resetAccentBtn"),
+  syncEnabled: document.getElementById("syncEnabled"),
+  syncWorkerUrl: document.getElementById("syncWorkerUrl"),
+  syncKey: document.getElementById("syncKey"),
+  syncNowBtn: document.getElementById("syncNowBtn"),
+  syncHint: document.getElementById("syncHint"),
   saveBtn: document.getElementById("saveBtn"),
   savedMsg: document.getElementById("savedMsg"),
 };
+
+function setSyncHint(text, type) {
+  if (!els.syncHint) return;
+  els.syncHint.textContent = text;
+  els.syncHint.classList.remove("error", "success");
+  if (type) els.syncHint.classList.add(type);
+}
 
 const ACCENT_PRESETS = [
   "#405de6", // xanh mặc định (IG blue/purple)
@@ -210,6 +222,19 @@ async function load() {
   els.contextTurns.value = s.contextTurns ?? 5;
   els.themeSelect.value = s.theme || "system";
   els.accentColor.value = s.accentColor || "#405de6";
+  els.syncEnabled.checked = s.syncEnabled === true;
+  els.syncWorkerUrl.value = s.syncWorkerUrl || "";
+  els.syncKey.value = s.syncKey || "";
+
+  const localStore = await chrome.storage.local.get({ igt_last_sync_at: 0 });
+  if (localStore.igt_last_sync_at) {
+    setSyncHint(
+      `Đồng bộ thành công lần cuối lúc ${new Date(
+        localStore.igt_last_sync_at
+      ).toLocaleString("vi-VN")}.`,
+      "success"
+    );
+  }
 
   // Nếu đã có model + API key đã lưu trước đó, hiện tạm option đó rồi tự
   // tải lại danh sách mới nhất để đối chiếu.
@@ -244,6 +269,60 @@ els.loadModelsBtn.addEventListener("click", () =>
   loadModelsFromApi({ preserveSelection: true })
 );
 
+els.syncNowBtn.addEventListener("click", async () => {
+  const syncWorkerUrl = els.syncWorkerUrl.value.trim();
+  const syncKey = els.syncKey.value.trim();
+  if (!syncWorkerUrl) {
+    setSyncHint("Hãy nhập Cloudflare Worker URL trước khi đồng bộ.", "error");
+    return;
+  }
+  if (!syncKey || syncKey.length < 6) {
+    setSyncHint("Sync Key cần tối thiểu 6 ký tự.", "error");
+    return;
+  }
+
+  els.syncNowBtn.disabled = true;
+  els.syncNowBtn.textContent = "Đang đồng bộ...";
+  setSyncHint("Đang mã hóa AES-256 và đồng bộ với Cloudflare KV...", null);
+
+  try {
+    // Lưu cấu hình sync hiện tại luôn để người dùng không quên bấm Lưu
+    await chrome.runtime.sendMessage({
+      type: "SAVE_SETTINGS",
+      settings: {
+        syncEnabled: els.syncEnabled.checked,
+        syncWorkerUrl,
+        syncKey,
+      },
+    });
+
+    const res = await chrome.runtime.sendMessage({
+      type: "SYNC_HISTORY_NOW",
+      config: {
+        syncEnabled: true,
+        syncWorkerUrl,
+        syncKey,
+      },
+    });
+
+    if (!res?.ok) {
+      throw new Error(res?.error || "Đồng bộ thất bại.");
+    }
+
+    setSyncHint(
+      `✓ Đồng bộ thành công ${res.count || 0} mục lịch sử lúc ${new Date(
+        res.syncedAt || Date.now()
+      ).toLocaleTimeString("vi-VN")}!`,
+      "success"
+    );
+  } catch (err) {
+    setSyncHint(`Lỗi đồng bộ: ${err.message || String(err)}`, "error");
+  } finally {
+    els.syncNowBtn.disabled = false;
+    els.syncNowBtn.textContent = "🔄 Đồng bộ ngay";
+  }
+});
+
 els.saveBtn.addEventListener("click", async () => {
   if (!els.model.value) {
     setModelHint("Hãy chọn 1 model trước khi lưu.", "error");
@@ -277,6 +356,9 @@ els.saveBtn.addEventListener("click", async () => {
     contextTurns: clampedContextTurns,
     theme: els.themeSelect.value,
     accentColor: els.accentColor.value,
+    syncEnabled: els.syncEnabled.checked,
+    syncWorkerUrl: els.syncWorkerUrl.value.trim(),
+    syncKey: els.syncKey.value.trim(),
   };
   await chrome.runtime.sendMessage({ type: "SAVE_SETTINGS", settings });
   els.savedMsg.classList.remove("hidden");
