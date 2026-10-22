@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<title>Cài đặt — Instagram Live Translator</title>
+<script src="theme.js"></script>
+<link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <div class="wrap">
+    <h1>Cài đặt Instagram Live Translator</h1>
+
+    <label class="field">
+      <span>Gemini API Key</span>
+      <input type="password" id="apiKey" placeholder="AIza..." autocomplete="off" />
+      <small>
+        Lấy API key tại
+        <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">
+          Google AI Studio
+        </a>. Key được lưu cục bộ trong trình duyệt (chrome.storage.sync), không gửi đi đâu khác ngoài gọi trực tiếp tới Gemini API.
+      </small>
+    </label>
+
+    <label class="field">
+      <span>Model Gemini</span>
+      <div class="model-row">
+        <select id="model">
+          <option value="" disabled selected>
+            -- Nhập API key rồi bấm "Tải danh sách" --
+          </option>
+        </select>
+        <button type="button" id="loadModelsBtn" class="btn small">
+          Tải danh sách
+        </button>
+      </div>
+      <small id="modelHint">
+        Danh sách được lấy trực tiếp từ tài khoản Gemini API của bạn, nên khi
+        Google ra model mới, chỉ cần bấm "Tải danh sách" lại — không cần cập
+        nhật extension.
+      </small>
+    </label>
+
+    <label class="field">
+      <span>Dịch tin nhắn ĐẾN sang ngôn ngữ</span>
+      <div id="incomingTargetLangSelect"></div>
+      <small>Ngôn ngữ hiển thị trong panel khi có người nhắn tới bạn.</small>
+    </label>
+
+    <label class="field">
+      <span>Dịch tin nhắn ĐI (bạn soạn) sang ngôn ngữ</span>
+      <div id="outgoingTargetLangSelect"></div>
+      <small>Ngôn ngữ mà tin bạn gõ sẽ được dịch sang trước khi gửi. Cũng có
+        thể đổi nhanh ngay trong side panel, cạnh ô soạn tin.</small>
+    </label>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="fastMode" checked />
+      <span>⚡ Chế độ siêu tốc (Fast Mode — phản hồi &lt;500ms)</span>
+    </label>
+    <small class="standalone-hint" style="margin-top:-6px; margin-bottom:12px;">
+      Tắt suy nghĩ ngầm (thinking) của Gemini 2.5 để phản hồi tức thì, không bị chờ đợi 3-5 giây. Khuyên dùng!
+    </small>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="useTranslationMemory" checked />
+      <span>📚 Bật Thư viện từ &amp; Bộ nhớ dịch tự động (phản hồi 0ms, tiết kiệm API)</span>
+    </label>
+    <small class="standalone-hint" style="margin-top:-6px; margin-bottom:12px;">
+      Tự động ghi nhớ các câu đã dịch và áp dụng Từ điển cá nhân (nút 📚 trên Side Panel). Khi gặp lại câu quen thuộc, extension dịch tức thì trong 0ms mà không cần gọi Gemini API.
+    </small>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="enablePhonetics" />
+      <span>Tạo phiên âm cách đọc (Pinyin / Romaji / IPA)</span>
+    </label>
+    <small class="standalone-hint" style="margin-top:-6px; margin-bottom:12px;">
+      Mặc định tắt để giảm thời gian sinh token và tăng tốc độ dịch gấp đôi. Bật khi bạn cần xem phiên âm.
+    </small>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="autoTranslateIncoming" />
+      <span>Tự động quét &amp; dịch tin nhắn đến (thử nghiệm, có thể không ổn định do Instagram hay đổi giao diện)</span>
+    </label>
+    <small class="standalone-hint">
+      Cách dùng khuyên dùng: trên Instagram, bôi đen đoạn tin nhắn cần dịch →
+      chuột phải → chọn "Dịch với Instagram Translator". Kết quả sẽ hiện ngay
+      trong panel này, đáng tin cậy hơn việc quét tự động.
+    </small>
+
+    <hr class="divider" />
+
+    <h2 class="section-title">Giao diện</h2>
+
+    <label class="field">
+      <span>Chế độ hiển thị</span>
+      <select id="themeSelect">
+        <option value="system">Theo hệ thống</option>
+        <option value="light">Sáng (Light)</option>
+        <option value="dark">Tối (Dark)</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>Màu chủ đạo</span>
+      <div class="accent-row">
+        <input type="color" id="accentColor" value="#405de6" />
+        <div class="accent-presets" id="accentPresets"></div>
+        <button type="button" id="resetAccentBtn" class="btn small">
+          Mặc định
+        </button>
+      </div>
+      <small>
+        Dùng cho nút chính, thẻ ngôn ngữ, các điểm nhấn trong giao diện —
+        áp dụng cho cả side panel lẫn trang Settings này.
+      </small>
+    </label>
+
+    <hr class="divider" />
+
+    <label class="field">
+      <span>Hướng dẫn phong cách dịch (tuỳ chỉnh)</span>
+      <textarea
+        id="customStyleInstruction"
+        rows="3"
+        placeholder="Ví dụ: xưng hô 'em - anh', giọng thân mật, lịch sự, dùng emoji nhẹ nhàng, tránh từ ngữ trang trọng..."
+      ></textarea>
+      <small>
+        Áp dụng cho mọi bản dịch (tin đến, tin đi) và cả gợi ý trả lời bên
+        dưới — dùng để tuỳ chỉnh văn phong, nhân xưng, mức độ trang trọng.
+        Để trống nếu muốn dịch tự nhiên theo mặc định.
+      </small>
+    </label>
+
+    <label class="field">
+      <span>Văn phong dịch mặc định</span>
+      <select id="personaStyle"></select>
+      <small>
+        Áp dụng cùng với hướng dẫn phong cách ở trên. Có thể đổi nhanh ngay
+        trong side panel, cạnh nút 📸.
+      </small>
+    </label>
+
+    <label class="field">
+      <span>Số lượt hội thoại gửi kèm làm ngữ cảnh</span>
+      <input type="number" id="contextTurns" min="0" max="10" value="5" />
+      <small>
+        Gửi kèm N bản dịch gần nhất để Gemini giữ xưng hô, giọng điệu nhất
+        quán trong cuộc trò chuyện. 0 = tắt (tiết kiệm token, nên dùng nếu
+        bạn hay chuyển qua lại giữa nhiều người).
+      </small>
+    </label>
+
+    <label class="field">
+      <span>Số lượng câu trả lời gợi ý</span>
+      <input type="number" id="suggestionCount" min="1" max="6" value="3" />
+      <small>
+        Mỗi khi bấm nút "💡 Gợi ý trả lời" dưới 1 tin nhắn đã dịch, extension
+        sẽ tạo ra từng này câu trả lời gợi ý (tiếng Việt kèm bản dịch sang
+        ngôn ngữ đối phương), theo đúng văn phong ở trên.
+      </small>
+    </label>
+
+    <hr class="divider" />
+
+    <h2 class="section-title">☁️ Đồng bộ Lịch sử &amp; Thư viện từ qua Cloudflare (E2E Encrypted)</h2>
+
+    <label class="field checkbox-field">
+      <input type="checkbox" id="syncEnabled" />
+      <span>Bật tự động đồng bộ Lịch sử &amp; Thư viện từ giữa các máy / trình duyệt</span>
+    </label>
+
+    <label class="field">
+      <span>Cloudflare Worker URL</span>
+      <input
+        type="text"
+        id="syncWorkerUrl"
+        placeholder="https://ig-trans-sync.<tên-bạn>.workers.dev"
+        autocomplete="off"
+      />
+      <small>
+        Đường dẫn Worker trên tài khoản Cloudflare của bạn (xem file
+        <code>cloudflare-worker/worker.js</code> trong thư mục dự án).
+      </small>
+    </label>
+
+    <label class="field">
+      <span>Khóa định danh cố định (Sync Key — tối thiểu 6 ký tự)</span>
+      <div class="model-row">
+        <input
+          type="password"
+          id="syncKey"
+          placeholder="Ví dụ: tam_phyll_love_2026"
+          autocomplete="off"
+        />
+        <button type="button" id="syncNowBtn" class="btn small">
+          🔄 Đồng bộ ngay
+        </button>
+      </div>
+      <small id="syncHint">
+        Nhập cùng một Sync Key trên mọi máy (Chrome / Edge). Toàn bộ Lịch sử dịch, Từ điển cá nhân và Bộ nhớ câu tự động được mã hóa AES-256 và đồng bộ hai chiều.
+      </small>
+    </label>
+
+    <button id="saveBtn" class="btn primary">Lưu cài đặt</button>
+    <span id="savedMsg" class="saved-msg hidden">Đã lưu ✓</span>
+  </div>
+
+  <script src="langselect.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

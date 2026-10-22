@@ -7,7 +7,12 @@
 
 (() => {
   const SEEN = new Set(); // tránh xử lý trùng 1 tin nhắn nhiều lần
+  const MAX_SEEN = 500;
   let observer = null;
+  let urlTimer = null;
+  let retryTimer = null;
+  let autoTranslateEnabled = false;
+  let lastUrl = location.href;
 
   function hashText(str) {
     let h = 0;
@@ -18,9 +23,7 @@
   }
 
   // SELECTOR: khung chứa toàn bộ danh sách tin nhắn của 1 thread đang mở.
-  // Instagram thường render các dòng tin nhắn với role="row" bên trong 1 vùng scroll.
   function findMessageContainer() {
-    // Thử vài chiến lược khác nhau, ưu tiên từ cụ thể -> chung chung.
     const candidates = [
       document.querySelector('div[role="grid"]'),
       document.querySelector('div[aria-label="Message list"]'),
@@ -29,22 +32,15 @@
     return candidates[0] || document.querySelector('div[role="main"]');
   }
 
-  // SELECTOR: xác định 1 "row" tin nhắn và text bên trong nó.
   function extractTextFromRow(rowEl) {
-    // Instagram thường bọc nội dung text trong các <div> / <span> lồng nhau.
-    // Loại bỏ các phần tử thường KHÔNG phải nội dung tin (nút reaction, avatar...).
     const text = rowEl.innerText?.trim();
     return text || "";
   }
 
-  // Heuristic phân biệt tin ĐẾN (của đối phương) và tin ĐI (của mình):
-  // Instagram thường canh tin của mình sang phải (justify-content / margin-left auto),
-  // tin của đối phương canh trái. Đây là heuristic, có thể cần chỉnh theo giao diện thật.
   function isIncomingRow(rowEl) {
     const style = window.getComputedStyle(rowEl);
     if (style.flexDirection === "row-reverse") return false;
     if (style.justifyContent === "flex-end") return false;
-    // Kiểm tra thêm: nếu row nằm bên trái nhiều hơn nửa chiều rộng container -> coi là incoming
     const rect = rowEl.getBoundingClientRect();
     const parentRect =
       rowEl.closest('[role="grid"]')?.getBoundingClientRect() ||
@@ -54,18 +50,23 @@
       const parentCenterX = parentRect.left + parentRect.width / 2;
       return centerX < parentCenterX;
     }
-    return true; // mặc định coi là incoming nếu không xác định được
+    return true;
   }
 
   function handleNewRow(rowEl) {
+    if (!autoTranslateEnabled) return;
     const text = extractTextFromRow(rowEl);
     if (!text) return;
 
     const id = hashText(text + "|" + (rowEl.dataset.igtId || ""));
     if (SEEN.has(id)) return;
+    if (SEEN.size >= MAX_SEEN) {
+      const oldest = SEEN.values().next().value;
+      if (oldest !== undefined) SEEN.delete(oldest);
+    }
     SEEN.add(id);
 
-    if (!isIncomingRow(rowEl)) return; // chỉ dịch tin ĐẾN
+    if (!isIncomingRow(rowEl)) return;
 
     chrome.runtime
       .sendMessage({
@@ -73,9 +74,7 @@
         text,
         messageId: id,
       })
-      .catch(() => {
-        /* background có thể chưa sẵn sàng, bỏ qua lỗi lặt vặt */
-      });
+      .catch(() => {});
   }
 
   function scanExistingRows(container) {
@@ -83,11 +82,30 @@
     rows.forEach((row) => handleNewRow(row));
   }
 
+  function stopObserving() {
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+    if (urlTimer) {
+      clearInterval(urlTimer);
+      urlTimer = null;
+    }
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  }
+
   function startObserving() {
+    if (!autoTranslateEnabled) {
+      stopObserving();
+      return;
+    }
     const container = findMessageContainer();
     if (!container) {
-      // Instagram SPA có thể chưa render xong, thử lại sau 1.5s
-      setTimeout(startObserving, 1500);
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = setTimeout(startObserving, 1500);
       return;
     }
 
@@ -96,6 +114,7 @@
     scanExistingRows(container);
 
     observer = new MutationObserver((mutations) => {
+      if (!autoTranslateEnabled) return;
       for (const m of mutations) {
         m.addedNodes.forEach((node) => {
           if (!(node instanceof HTMLElement)) return;
@@ -111,24 +130,40 @@
     });
 
     observer.observe(container, { childList: true, subtree: true });
+
+    if (!urlTimer) {
+      urlTimer = setInterval(() => {
+        if (!autoTranslateEnabled) return;
+        if (location.href !== lastUrl) {
+          lastUrl = location.href;
+          SEEN.clear();
+          startObserving();
+        }
+      }, 1500);
+    }
   }
 
-  // Instagram là SPA (React) — chuyển thread không load lại trang.
-  // Theo dõi thay đổi URL để re-attach observer vào container mới.
-  let lastUrl = location.href;
-  setInterval(() => {
-    if (location.href !== lastUrl) {
-      lastUrl = location.href;
-      SEEN.clear();
+  // Chỉ bật MutationObserver khi người dùng thực sự bật "Tự động dịch tin đến"
+  // để không làm chậm trang Instagram Direct và không bắn message thừa về background.
+  chrome.storage.sync.get({ autoTranslateIncoming: false }, (res) => {
+    autoTranslateEnabled = Boolean(res?.autoTranslateIncoming);
+    if (autoTranslateEnabled) {
       startObserving();
     }
-  }, 1000);
+  });
 
-  startObserving();
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName === "sync" && changes.autoTranslateIncoming) {
+      autoTranslateEnabled = Boolean(changes.autoTranslateIncoming.newValue);
+      if (autoTranslateEnabled) {
+        startObserving();
+      } else {
+        stopObserving();
+      }
+    }
+  });
 
   // ---- Chèn text vào ô soạn tin (được background gọi qua executeScript) ----
-  // SELECTOR: ô soạn tin của Instagram Direct là 1 div[contenteditable="true"],
-  // thường có aria-label chứa "Message" hoặc placeholder tương tự.
   function findComposeBox() {
     const candidates = [
       document.querySelector('div[aria-label="Message"][contenteditable="true"]'),
@@ -144,13 +179,9 @@
 
     box.focus();
 
-    // Chèn text theo cách React kiểm soát input sẽ nhận diện được:
-    // dùng execCommand (vẫn hoạt động trong contenteditable dù deprecated)
-    // để trigger đúng input events mà React lắng nghe.
     document.execCommand("selectAll", false, undefined);
     document.execCommand("insertText", false, text);
 
-    // Fallback nếu execCommand không có tác dụng (một số trình duyệt/site chặn):
     if (box.innerText.trim() !== text.trim()) {
       box.innerText = text;
       box.dispatchEvent(new InputEvent("input", { bubbles: true }));

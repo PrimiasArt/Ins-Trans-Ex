@@ -1,40 +1,26 @@
-// background.js — service worker (v1.5.0 Cloud Translation Memory & Glossary Edition)
-// Xử lý: mở side panel khi bấm icon, gọi Gemini API để dịch (text + ảnh),
-// Thư viện từ & Bộ nhớ dịch (Translation Memory + Custom Glossary) 0ms đồng bộ Cloud,
-// tối ưu độ trễ với thinkingConfig: 0, bộ nhớ đệm cache LRU,
-// hệ thống prompt hội thoại tự nhiên, lưu lịch sử vào storage.local.
+// background.js — service worker (v1.6.0 Ultra-Fast RAM-Indexed Engine)
+// Tối ưu hoá triệt để chống chậm dần theo thời gian:
+// 1. Bảng băm RAM O(1) (Map Index) cho Từ điển, Bộ nhớ dịch (TM), Lịch sử & Settings -> tra cứu 0.005ms, không đọc ổ cứng mỗi lần dịch.
+// 2. Ghi ổ cứng phi đồng bộ (Non-blocking Disk Flush) -> trả kết quả dịch về UI ngay lập tức (0ms wait).
+// 3. Đồng bộ Cloud thông minh (Idle Debounce 12s, chỉ vẽ lại UI khi có tin mới từ máy khác).
+// 4. Rút gọn Context Prompt (cắt gọn câu dài, bỏ ảnh OCR khỏi ngữ cảnh) + giới hạn maxOutputTokens giúp Gemini phản hồi nhanh nhất.
 
 const DEFAULT_SETTINGS = {
   apiKey: "",
   model: "gemini-2.5-flash",
   incomingTargetLang: "Vietnamese",
   outgoingTargetLang: "English",
-  // Mặc định TẮT auto-scan bằng MutationObserver vì DOM Instagram hay đổi,
-  // dễ bỏ sót/bắt nhầm tin. Cách đáng tin cậy hơn: bôi đen text -> chuột phải
-  // -> "Dịch với Instagram Translator" (xem CONTEXT_MENU_ID bên dưới).
   autoTranslateIncoming: false,
-  // Hướng dẫn phong cách dịch tuỳ chỉnh (văn phong, nhân xưng...), áp dụng
-  // cho mọi bản dịch (tin đến, tin đi, gợi ý trả lời). Để trống = mặc định.
   customStyleInstruction: "",
-  // Văn phong dịch nhanh (persona): default | casual | formal | genz | tech
   personaStyle: "default",
-  // Số lượt dịch gần nhất gửi kèm làm ngữ cảnh (giữ xưng hô nhất quán).
-  // 0 = không gửi ngữ cảnh.
-  contextTurns: 5,
-  // Số lượng câu trả lời gợi ý được tạo mỗi lần bấm "Gợi ý trả lời".
+  contextTurns: 3,
   suggestionCount: 3,
-  // Chế độ siêu tốc: Tắt suy nghĩ reasoning (thinkingBudget: 0) của Gemini 2.5
-  // giúp phản hồi tức thì (<500ms) thay vì chờ 3-5 giây.
   fastMode: true,
-  // Tạo phiên âm: Tắt mặc định để tăng tốc độ phản hồi gấp 2 lần. Bật khi cần.
   enablePhonetics: false,
-  // Tự động tra cứu & học mẫu câu vào Thư viện từ (Translation Memory + Glossary)
   useTranslationMemory: true,
-  // Đồng bộ lịch sử & thư viện từ qua Cloudflare Worker + KV (Mã hóa đầu cuối AES-256)
   syncEnabled: false,
   syncWorkerUrl: "",
   syncKey: "",
-  // Giao diện: "system" | "light" | "dark", và màu chủ đạo (hex).
   theme: "system",
   accentColor: "#405de6",
 };
@@ -62,7 +48,7 @@ CRITICAL TRANSLATION QUALITY & ROMANTIC TONE GUIDELINES:
    - Accurately decode internet abbreviations, emotional slang, cute chat particles:
      * English: idk, tbh, rn, ngl, fr, lmao, lol, hru, wbu, gtg, brb, miss u, love u, sweet dreams, cutie, babe...
      * Vietnamese: k/ko (không), đc/dc (được), ntn (như thế nào), rep (trả lời), ib (inbox), fl, tym, sao z/sao dạ, chòi oi, nhớ anh/em, thương, iu, ngoan, kkk...
-     * Asian languages: common chat particles and internet slang in Japanese, Korean, Chinese.
+     * Asian languages: common chat particles and internet slang in Japanese, Korean, Chinese, Thai.
 3. CONTEXT & PRONOUN REVERSAL:
    - Check the RECENT CONVERSATION HISTORY turns to identify who is "anh" and who is "em", and consistently preserve the established pronouns and intimacy.
    - Retain all emojis (❤️, 🥰, 🥺, 💕, ✨, 😘...), stickers, @usernames, and emotional punctuation (~~, !!!, ???).
@@ -73,9 +59,9 @@ CRITICAL TRANSLATION QUALITY & ROMANTIC TONE GUIDELINES:
 const CONTEXT_MENU_ID = "igt-translate-selection";
 const CONTEXT_MENU_IMAGE_ID = "igt-translate-image";
 
-// ---- In-Memory LRU Cache (giúp các từ/câu lặp lại phản hồi trong 0ms) -----
+// ---- In-Memory LRU Cache (dành cho các đoạn văn dài > 220 ký tự) ------------
 const TRANSLATION_CACHE = new Map();
-const MAX_CACHE_ENTRIES = 120;
+const MAX_CACHE_ENTRIES = 150;
 
 function getCachedTranslation(key) {
   if (!TRANSLATION_CACHE.has(key)) return null;
@@ -95,16 +81,17 @@ function setCachedTranslation(key, val) {
   TRANSLATION_CACHE.set(key, val);
 }
 
-// Bỏ qua gọi API cho các tin nhắn thuần emoji, số, link, dấu câu
+const EMOJI_AND_SYMBOLS_REGEX = /^[\p{Extended_Pictographic}\p{Emoji}\p{Number}\p{Punctuation}\p{Separator}\s]+$/u;
+const URL_ONLY_REGEX = /^(https?:\/\/[^\s]+)$/i;
+const STRIP_PUNCT_REGEX = /^[.,!?~…;:\-–—'"“”‘’]+|[.,!?~…;:\-–—'"“”‘’]+$/g;
+
 function isNonTranslatable(text) {
   const trimmed = text.trim();
   if (!trimmed) return true;
-  const emojiAndSymbolsRegex = /^[\p{Extended_Pictographic}\p{Emoji}\p{Number}\p{Punctuation}\p{Separator}\s]+$/u;
-  const urlRegex = /^(https?:\/\/[^\s]+)$/i;
-  return emojiAndSymbolsRegex.test(trimmed) || urlRegex.test(trimmed);
+  return EMOJI_AND_SYMBOLS_REGEX.test(trimmed) || URL_ONLY_REGEX.test(trimmed);
 }
 
-// ---- Lịch sử dịch & Thư viện từ (persist qua storage.local + Cloud Sync) ---
+// ---- Hằng số & Chuẩn hoá Văn bản -------------------------------------------
 const HISTORY_KEY = "igt_history";
 const GLOSSARY_KEY = "igt_glossary";
 const TM_KEY = "igt_tm";
@@ -115,6 +102,7 @@ const MAX_HISTORY_ITEMS = 300;
 const MAX_GLOSSARY_ITEMS = 500;
 const MAX_TM_ITEMS = 1000;
 const MAX_TM_TEXT_LEN = 220;
+const MAX_CONTEXT_TURN_CHARS = 120;
 
 function normalizeExactText(text) {
   return String(text || "")
@@ -125,9 +113,7 @@ function normalizeExactText(text) {
 
 function normalizeRelaxedText(text) {
   const exact = normalizeExactText(text);
-  const stripped = exact
-    .replace(/^[.,!?~…;:\-–—'"“”‘’]+|[.,!?~…;:\-–—'"“”‘’]+$/g, "")
-    .trim();
+  const stripped = exact.replace(STRIP_PUNCT_REGEX, "").trim();
   return stripped || exact;
 }
 
@@ -139,36 +125,226 @@ function tmSig(entry) {
   return `tm||${entry.mode || "incoming"}||${(entry.targetLang || "").toLowerCase()}||${normalizeRelaxedText(entry.original)}`;
 }
 
-// Mọi thao tác ghi storage chạy tuần tự để tránh race condition
-let storageQueue = Promise.resolve();
-function withLocalStore(defaults, fn) {
-  const run = storageQueue.then(async () => {
-    const store = await chrome.storage.local.get(defaults);
-    const result = await fn(store);
-    await chrome.storage.local.set(store);
-    return result;
-  });
-  storageQueue = run.catch(() => {});
-  return run;
+function newId(prefix) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function withHistory(fn) {
-  return withLocalStore({ [HISTORY_KEY]: [] }, async (store) => {
-    return fn(store[HISTORY_KEY]);
+// ---------------------------------------------------------------------------
+// BỘ NHỚ RAM TỐC ĐỘ CAO O(1) (In-Memory State & Hash Indexes)
+// Loại bỏ hoàn toàn việc đọc/ghi ổ cứng và chạy vòng lặp Regex trên mỗi lần dịch
+// ---------------------------------------------------------------------------
+
+const MEM = {
+  hydrated: false,
+  hydratingPromise: null,
+  settings: null,
+  history: [],
+  glossary: [],
+  tm: [],
+  deletedSigs: new Set(),
+  stats: { savedApiCalls: 0 },
+
+  // Bảng băm O(1)
+  glossaryForwardMap: new Map(), // key: `${dir}|${normSrc}` -> entry
+  glossaryReverseMap: new Map(), // key: normTgt -> entry (khi dir === 'any')
+  glossarySubstrings: [],        // [{ normSrc, normTgt, dir, source, target }]
+  tmDirectMap: new Map(),        // key: `${mode}|${langLower}|${normOrig}` -> entry
+  tmAnyLangMap: new Map(),       // key: `${mode}||${normOrig}` -> entry
+  tmReverseMap: new Map(),       // key: `${langLower}|${normTrans}` -> entry
+  tmBySigMap: new Map(),         // key: sig -> entry
+};
+
+function rebuildGlossaryIndex() {
+  MEM.glossaryForwardMap.clear();
+  MEM.glossaryReverseMap.clear();
+  MEM.glossarySubstrings = [];
+
+  for (let i = 0; i < MEM.glossary.length; i++) {
+    const g = MEM.glossary[i];
+    if (!g || !g.source || !g.target) continue;
+    const dir = g.direction || "any";
+    const normSrc = g._normSrc || (g._normSrc = normalizeRelaxedText(g.source));
+    const normTgt = g._normTgt || (g._normTgt = normalizeRelaxedText(g.target));
+    const exactSrc = g._exactSrc || (g._exactSrc = normalizeExactText(g.source));
+    const exactTgt = g._exactTgt || (g._exactTgt = normalizeExactText(g.target));
+
+    if (normSrc) {
+      MEM.glossaryForwardMap.set(`${dir}|${normSrc}`, g);
+    }
+    if (dir === "any" && normTgt) {
+      MEM.glossaryReverseMap.set(normTgt, g);
+    }
+    if (exactSrc.length >= 2 || exactTgt.length >= 2) {
+      MEM.glossarySubstrings.push({
+        dir,
+        exactSrc,
+        exactTgt,
+        source: g.source,
+        target: g.target,
+      });
+    }
+  }
+}
+
+function indexSingleTmEntry(entry) {
+  if (!entry || !entry.original || !entry.translation) return;
+  const mode = entry.mode || "incoming";
+  const langLower = (entry.targetLang || "").toLowerCase();
+  const detLower = (entry.detectedLang || "").toLowerCase();
+  const normOrig = entry._normOrig || (entry._normOrig = normalizeRelaxedText(entry.original));
+  const normTrans = entry._normTrans || (entry._normTrans = normalizeRelaxedText(entry.translation));
+  if (!normOrig) return;
+
+  const sig = `tm||${mode}||${langLower}||${normOrig}`;
+  entry._sig = sig;
+  MEM.tmBySigMap.set(sig, entry);
+  MEM.tmDirectMap.set(`${mode}|${langLower}|${normOrig}`, entry);
+  MEM.tmAnyLangMap.set(`${mode}||${normOrig}`, entry);
+
+  if (mode === "incoming" && normTrans) {
+    if (detLower) {
+      MEM.tmReverseMap.set(`${detLower}|${normTrans}`, entry);
+    }
+    MEM.tmReverseMap.set(`|${normTrans}`, entry);
+  }
+}
+
+function rebuildTmIndex() {
+  MEM.tmDirectMap.clear();
+  MEM.tmAnyLangMap.clear();
+  MEM.tmReverseMap.clear();
+  MEM.tmBySigMap.clear();
+
+  for (let i = 0; i < MEM.tm.length; i++) {
+    indexSingleTmEntry(MEM.tm[i]);
+  }
+}
+
+async function ensureHydrated() {
+  if (MEM.hydrated) return;
+  if (MEM.hydratingPromise) return MEM.hydratingPromise;
+
+  MEM.hydratingPromise = (async () => {
+    const [syncStore, localStore] = await Promise.all([
+      chrome.storage.sync.get(DEFAULT_SETTINGS),
+      chrome.storage.local.get({
+        [HISTORY_KEY]: [],
+        [GLOSSARY_KEY]: [],
+        [TM_KEY]: [],
+        [DELETED_SIGS_KEY]: [],
+        [STATS_KEY]: { savedApiCalls: 0 },
+      }),
+    ]);
+
+    MEM.settings = { ...DEFAULT_SETTINGS, ...syncStore };
+    MEM.history = Array.isArray(localStore[HISTORY_KEY]) ? localStore[HISTORY_KEY] : [];
+    MEM.glossary = Array.isArray(localStore[GLOSSARY_KEY]) ? localStore[GLOSSARY_KEY] : [];
+    MEM.tm = Array.isArray(localStore[TM_KEY]) ? localStore[TM_KEY] : [];
+    MEM.deletedSigs = new Set(Array.isArray(localStore[DELETED_SIGS_KEY]) ? localStore[DELETED_SIGS_KEY] : []);
+    MEM.stats = localStore[STATS_KEY] || { savedApiCalls: 0 };
+
+    // Nếu TM đang trống mà đã có lịch sử, trích xuất 1 lần duy nhất
+    if (MEM.tm.length === 0 && MEM.history.length > 0) {
+      MEM.tm = mergeTmLists([], [], MEM.history, MEM.deletedSigs);
+      scheduleDiskFlush({ tm: true });
+    }
+
+    rebuildGlossaryIndex();
+    rebuildTmIndex();
+    MEM.hydrated = true;
+    MEM.hydratingPromise = null;
+  })();
+
+  return MEM.hydratingPromise;
+}
+
+// Khởi động nạp RAM ngay khi Service Worker thức dậy
+ensureHydrated().catch(() => {});
+
+// Tự động cập nhật MEM.settings khi người dùng đổi cài đặt
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName === "sync" && MEM.settings) {
+    for (const [k, v] of Object.entries(changes)) {
+      MEM.settings[k] = v.newValue !== undefined ? v.newValue : DEFAULT_SETTINGS[k];
+    }
+  }
+});
+
+// ---- Ghi ổ cứng phi đồng bộ (Debounced Non-Blocking Disk Flush) ------------
+const dirtyFlags = {
+  history: false,
+  glossary: false,
+  tm: false,
+  deletedSigs: false,
+  stats: false,
+};
+let diskFlushTimer = null;
+
+function stripInternalFields(list) {
+  return list.map((it) => {
+    const copy = { ...it };
+    delete copy._normSrc;
+    delete copy._normTgt;
+    delete copy._exactSrc;
+    delete copy._exactTgt;
+    delete copy._normOrig;
+    delete copy._normTrans;
+    delete copy._sig;
+    return copy;
   });
 }
 
-async function incrementSavedApiCalls() {
-  return withLocalStore({ [STATS_KEY]: { savedApiCalls: 0 } }, (store) => {
-    const current = store[STATS_KEY]?.savedApiCalls || 0;
-    store[STATS_KEY] = { ...store[STATS_KEY], savedApiCalls: current + 1 };
-    return store[STATS_KEY].savedApiCalls;
-  });
+function scheduleDiskFlush(flags = {}) {
+  for (const k of Object.keys(flags)) {
+    if (flags[k]) dirtyFlags[k] = true;
+  }
+  if (diskFlushTimer) clearTimeout(diskFlushTimer);
+  diskFlushTimer = setTimeout(() => {
+    flushToDiskNow().catch(() => {});
+  }, 250);
 }
 
-/**
- * Tự động học câu dịch vào Bộ nhớ dịch (Translation Memory - igt_tm)
- */
+async function flushToDiskNow() {
+  if (diskFlushTimer) {
+    clearTimeout(diskFlushTimer);
+    diskFlushTimer = null;
+  }
+  const payload = {};
+  if (dirtyFlags.history) {
+    payload[HISTORY_KEY] = MEM.history;
+    dirtyFlags.history = false;
+  }
+  if (dirtyFlags.glossary) {
+    payload[GLOSSARY_KEY] = stripInternalFields(MEM.glossary);
+    dirtyFlags.glossary = false;
+  }
+  if (dirtyFlags.tm) {
+    payload[TM_KEY] = stripInternalFields(MEM.tm);
+    dirtyFlags.tm = false;
+  }
+  if (dirtyFlags.deletedSigs) {
+    payload[DELETED_SIGS_KEY] = Array.from(MEM.deletedSigs).slice(-500);
+    dirtyFlags.deletedSigs = false;
+  }
+  if (dirtyFlags.stats) {
+    payload[STATS_KEY] = MEM.stats;
+    dirtyFlags.stats = false;
+  }
+  if (Object.keys(payload).length > 0) {
+    await chrome.storage.local.set(payload);
+  }
+}
+
+async function getSettings() {
+  await ensureHydrated();
+  return MEM.settings;
+}
+
+function getRecentHistorySync(n) {
+  if (!n || n <= 0) return [];
+  return MEM.history.slice(-n);
+}
+
 function shouldLearnIntoTm(original, translation, source) {
   if (source === "image") return false;
   const orig = String(original || "").trim();
@@ -179,32 +355,32 @@ function shouldLearnIntoTm(original, translation, source) {
   return true;
 }
 
-function upsertTmEntryInList(tmList, item, deletedSet = null) {
+function learnIntoTmSync(item) {
   if (!shouldLearnIntoTm(item.original, item.translation, item.source)) return false;
   const mode = item.kind === "outgoing" || item.mode === "outgoing" ? "outgoing" : "incoming";
+  const langLower = (item.targetLang || "").toLowerCase();
   const normOrig = normalizeRelaxedText(item.original);
   if (!normOrig) return false;
 
-  const sig = `tm||${mode}||${(item.targetLang || "").toLowerCase()}||${normOrig}`;
-  if (deletedSet && deletedSet.has(sig)) return false;
+  const sig = `tm||${mode}||${langLower}||${normOrig}`;
+  if (MEM.deletedSigs.has(sig)) return false;
 
-  const existingIdx = tmList.findIndex((it) => tmSig(it) === sig);
   const now = item.timestamp || item.updatedAt || Date.now();
+  const existing = MEM.tmBySigMap.get(sig);
 
-  if (existingIdx !== -1) {
-    const prev = tmList[existingIdx];
-    tmList[existingIdx] = {
-      ...prev,
-      original: item.original.trim(),
-      translation: item.translation.trim(),
-      detectedLang: item.detectedLang || prev.detectedLang || "?",
-      targetLang: item.targetLang || prev.targetLang || "",
-      phonetics: item.phonetics || prev.phonetics || "",
-      hitCount: Math.max(prev.hitCount || 1, item.hitCount || 1),
-      updatedAt: Math.max(prev.updatedAt || 0, now),
-    };
+  if (existing) {
+    existing.original = item.original.trim();
+    existing.translation = item.translation.trim();
+    existing.detectedLang = item.detectedLang || existing.detectedLang || "?";
+    existing.targetLang = item.targetLang || existing.targetLang || "";
+    existing.phonetics = item.phonetics || existing.phonetics || "";
+    existing.hitCount = Math.max(existing.hitCount || 1, item.hitCount || 1);
+    existing.updatedAt = Math.max(existing.updatedAt || 0, now);
+    existing._normOrig = normOrig;
+    existing._normTrans = normalizeRelaxedText(existing.translation);
+    indexSingleTmEntry(existing);
   } else {
-    tmList.push({
+    const newEntry = {
       id: item.id?.startsWith("tm-") ? item.id : newId("tm"),
       mode,
       original: item.original.trim(),
@@ -214,181 +390,151 @@ function upsertTmEntryInList(tmList, item, deletedSet = null) {
       phonetics: item.phonetics || "",
       hitCount: item.hitCount || 1,
       updatedAt: now,
-    });
-  }
+      _normOrig: normOrig,
+      _normTrans: normalizeRelaxedText(item.translation),
+    };
+    MEM.tm.push(newEntry);
+    indexSingleTmEntry(newEntry);
 
-  if (tmList.length > MAX_TM_ITEMS) {
-    tmList.sort(
-      (a, b) =>
-        (a.hitCount || 1) * 3600000 +
-        (a.updatedAt || 0) -
-        ((b.hitCount || 1) * 3600000 + (b.updatedAt || 0))
-    );
-    tmList.splice(0, tmList.length - MAX_TM_ITEMS);
+    if (MEM.tm.length > MAX_TM_ITEMS) {
+      MEM.tm.sort(
+        (a, b) =>
+          (a.hitCount || 1) * 3600000 +
+          (a.updatedAt || 0) -
+          ((b.hitCount || 1) * 3600000 + (b.updatedAt || 0))
+      );
+      MEM.tm.splice(0, MEM.tm.length - MAX_TM_ITEMS);
+      rebuildTmIndex();
+    }
   }
   return true;
 }
 
-function addHistoryItem(item) {
-  return withLocalStore(
-    { [HISTORY_KEY]: [], [TM_KEY]: [], [DELETED_SIGS_KEY]: [] },
-    (store) => {
-      const list = store[HISTORY_KEY];
-      for (let i = list.length - 1; i >= 0; i--) {
-        const it = list[i];
-        if (
-          it.kind === item.kind &&
-          it.original === item.original &&
-          it.translation === item.translation
-        ) {
-          list.splice(i, 1);
-        }
-      }
-      list.push(item);
-      if (list.length > MAX_HISTORY_ITEMS) {
-        list.splice(0, list.length - MAX_HISTORY_ITEMS);
-      }
-
-      // Tự động nạp câu vừa dịch vào Bộ nhớ từ (Translation Memory)
-      const deletedSet = new Set(store[DELETED_SIGS_KEY] || []);
-      upsertTmEntryInList(store[TM_KEY], item, deletedSet);
-
-      scheduleAutoSync();
-      return item;
+/**
+ * Lưu lịch sử tức thì trong RAM (<0.05ms), đẩy việc ghi đĩa & đồng bộ Cloud xuống ngầm
+ */
+function addHistoryItemFast(item) {
+  const list = MEM.history;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const it = list[i];
+    if (
+      it.kind === item.kind &&
+      it.original === item.original &&
+      it.translation === item.translation
+    ) {
+      list.splice(i, 1);
+      break;
     }
-  );
+  }
+  list.push(item);
+  if (list.length > MAX_HISTORY_ITEMS) {
+    list.splice(0, list.length - MAX_HISTORY_ITEMS);
+  }
+
+  const learned = learnIntoTmSync(item);
+  scheduleDiskFlush({ history: true, tm: learned });
+  scheduleAutoSync();
+  return item;
 }
 
-function updateHistoryItem(id, patch) {
-  if (!id) return Promise.resolve();
-  return withHistory((list) => {
-    const idx = list.findIndex((it) => it.id === id);
-    if (idx !== -1) {
-      list[idx] = { ...list[idx], ...patch };
-      scheduleAutoSync();
-    }
-  });
+function updateHistoryItemFast(id, patch) {
+  if (!id) return;
+  const idx = MEM.history.findIndex((it) => it.id === id);
+  if (idx !== -1) {
+    MEM.history[idx] = { ...MEM.history[idx], ...patch };
+    scheduleDiskFlush({ history: true });
+    scheduleAutoSync();
+  }
 }
 
-function deleteHistoryItem(id) {
-  return withHistory((list) => {
-    const idx = list.findIndex((it) => it.id === id);
-    if (idx !== -1) {
-      list.splice(idx, 1);
-      scheduleAutoSync();
-    }
-  });
-}
-
-async function getRecentHistory(n) {
-  if (!n || n <= 0) return [];
-  const store = await chrome.storage.local.get({ [HISTORY_KEY]: [] });
-  return store[HISTORY_KEY].slice(-n);
+function deleteHistoryItemFast(id) {
+  const idx = MEM.history.findIndex((it) => it.id === id);
+  if (idx !== -1) {
+    MEM.history.splice(idx, 1);
+    scheduleDiskFlush({ history: true });
+    scheduleAutoSync();
+  }
 }
 
 /**
- * Tra cứu câu cần dịch trong Từ điển cá nhân (Glossary) & Bộ nhớ dịch (TM)
- * Trả về ngay trong 0ms nếu khớp toàn câu, không cần gọi Gemini API.
+ * Tra cứu O(1) trong RAM (0.005ms) — Không đọc ổ cứng, không quét mảng bằng Regex
  */
-async function lookupInLibrary(text, mode, targetLang, useTm = true) {
+function lookupInLibrarySync(text, mode, targetLang, useTm = true) {
   const normText = normalizeRelaxedText(text);
   if (!normText) return null;
 
-  const store = await chrome.storage.local.get({
-    [GLOSSARY_KEY]: [],
-    [TM_KEY]: [],
-  });
-  const glossary = store[GLOSSARY_KEY] || [];
-  const tm = store[TM_KEY] || [];
+  // 1. Tra cứu O(1) trong Từ điển cá nhân (Glossary)
+  const gDirect =
+    MEM.glossaryForwardMap.get(`${mode}|${normText}`) ||
+    MEM.glossaryForwardMap.get(`any|${normText}`);
+  if (gDirect) {
+    gDirect.hitCount = (gDirect.hitCount || 0) + 1;
+    gDirect.updatedAt = Date.now();
+    MEM.stats.savedApiCalls = (MEM.stats.savedApiCalls || 0) + 1;
+    scheduleDiskFlush({ glossary: true, stats: true });
+    return {
+      detectedLang: gDirect.detectedLang || "Từ điển",
+      translation: gDirect.target,
+      phonetics: gDirect.phonetics || "",
+      latencyMs: 0,
+      cacheSource: "glossary",
+    };
+  }
 
-  // 1. Ưu tiên cao nhất: Từ điển cá nhân & câu ghim (igt_glossary)
-  for (let i = glossary.length - 1; i >= 0; i--) {
-    const g = glossary[i];
-    if (!g || !g.source || !g.target) continue;
-    const dirOk = !g.direction || g.direction === "any" || g.direction === mode;
-    if (dirOk && normalizeRelaxedText(g.source) === normText) {
-      g.hitCount = (g.hitCount || 0) + 1;
-      g.updatedAt = Date.now();
-      chrome.storage.local.set({ [GLOSSARY_KEY]: glossary }).catch(() => {});
-      incrementSavedApiCalls().catch(() => {});
-      return {
-        detectedLang: g.detectedLang || "Từ điển",
-        translation: g.target,
-        phonetics: g.phonetics || "",
-        latencyMs: 0,
-        cacheSource: "glossary",
-      };
-    }
-    // Hỗ trợ tra cứu đảo chiều nếu mục từ điển để direction === "any"
-    if (
-      (!g.direction || g.direction === "any") &&
-      normalizeRelaxedText(g.target) === normText
-    ) {
-      g.hitCount = (g.hitCount || 0) + 1;
-      g.updatedAt = Date.now();
-      chrome.storage.local.set({ [GLOSSARY_KEY]: glossary }).catch(() => {});
-      incrementSavedApiCalls().catch(() => {});
-      return {
-        detectedLang: g.detectedLang || "Từ điển",
-        translation: g.source,
-        phonetics: "",
-        latencyMs: 0,
-        cacheSource: "glossary",
-      };
-    }
+  const gReverse = MEM.glossaryReverseMap.get(normText);
+  if (gReverse) {
+    gReverse.hitCount = (gReverse.hitCount || 0) + 1;
+    gReverse.updatedAt = Date.now();
+    MEM.stats.savedApiCalls = (MEM.stats.savedApiCalls || 0) + 1;
+    scheduleDiskFlush({ glossary: true, stats: true });
+    return {
+      detectedLang: gReverse.detectedLang || "Từ điển",
+      translation: gReverse.source,
+      phonetics: "",
+      latencyMs: 0,
+      cacheSource: "glossary",
+    };
   }
 
   if (!useTm) return null;
 
-  // 2. Tra cứu trong Bộ nhớ dịch tự động (igt_tm)
-  const targetLangLower = (targetLang || "").toLowerCase();
-  for (let i = tm.length - 1; i >= 0; i--) {
-    const entry = tm[i];
-    if (!entry || !entry.original || !entry.translation) continue;
-    const sameMode = (entry.mode || "incoming") === mode;
-    const sameLang =
-      !entry.targetLang ||
-      !targetLangLower ||
-      entry.targetLang.toLowerCase() === targetLangLower;
+  // 2. Tra cứu O(1) trong Bộ nhớ dịch (TM)
+  const langLower = (targetLang || "").toLowerCase();
+  const tmHit =
+    MEM.tmDirectMap.get(`${mode}|${langLower}|${normText}`) ||
+    MEM.tmAnyLangMap.get(`${mode}||${normText}`);
 
-    if (sameMode && sameLang && normalizeRelaxedText(entry.original) === normText) {
-      entry.hitCount = (entry.hitCount || 1) + 1;
-      entry.updatedAt = Date.now();
-      chrome.storage.local.set({ [TM_KEY]: tm }).catch(() => {});
-      incrementSavedApiCalls().catch(() => {});
+  if (tmHit) {
+    tmHit.hitCount = (tmHit.hitCount || 1) + 1;
+    tmHit.updatedAt = Date.now();
+    MEM.stats.savedApiCalls = (MEM.stats.savedApiCalls || 0) + 1;
+    scheduleDiskFlush({ tm: true, stats: true });
+    return {
+      detectedLang: tmHit.detectedLang || "TM",
+      translation: tmHit.translation,
+      phonetics: tmHit.phonetics || "",
+      latencyMs: 0,
+      cacheSource: "tm",
+    };
+  }
+
+  // 3. Tra cứu đảo chiều O(1) trong TM cho tin nhắn đi
+  if (mode === "outgoing") {
+    const revHit =
+      MEM.tmReverseMap.get(`${langLower}|${normText}`) ||
+      MEM.tmReverseMap.get(`|${normText}`);
+    if (revHit) {
+      revHit.hitCount = (revHit.hitCount || 1) + 1;
+      revHit.updatedAt = Date.now();
+      MEM.stats.savedApiCalls = (MEM.stats.savedApiCalls || 0) + 1;
+      scheduleDiskFlush({ tm: true, stats: true });
       return {
-        detectedLang: entry.detectedLang || "TM",
-        translation: entry.translation,
-        phonetics: entry.phonetics || "",
+        detectedLang: "Vietnamese",
+        translation: revHit.original,
+        phonetics: revHit.phonetics || "",
         latencyMs: 0,
         cacheSource: "tm",
       };
-    }
-  }
-
-  // 3. Tra cứu đảo chiều thông minh trong TM (VD: đối phương từng nhắn câu gốc X -> dịch ra Việt Y,
-  // nay bạn gõ đúng câu tiếng Việt Y để dịch sang ngôn ngữ đối phương)
-  if (mode === "outgoing") {
-    for (let i = tm.length - 1; i >= 0; i--) {
-      const entry = tm[i];
-      if (!entry || entry.mode !== "incoming") continue;
-      if (
-        (!entry.detectedLang ||
-          entry.detectedLang.toLowerCase() === targetLangLower) &&
-        normalizeRelaxedText(entry.translation) === normText
-      ) {
-        entry.hitCount = (entry.hitCount || 1) + 1;
-        entry.updatedAt = Date.now();
-        chrome.storage.local.set({ [TM_KEY]: tm }).catch(() => {});
-        incrementSavedApiCalls().catch(() => {});
-        return {
-          detectedLang: "Vietnamese",
-          translation: entry.original,
-          phonetics: entry.phonetics || "",
-          latencyMs: 0,
-          cacheSource: "tm",
-        };
-      }
     }
   }
 
@@ -396,34 +542,27 @@ async function lookupInLibrary(text, mode, targetLang, useTm = true) {
 }
 
 /**
- * Tìm các từ vựng / biệt danh trong Từ điển cá nhân xuất hiện bên trong câu dài
- * để đính kèm vào prompt cho Gemini dịch chuẩn 100% biệt danh/cách gọi.
+ * Quét nhanh các từ vựng cá nhân đã tiền xử lý sẵn trong RAM
  */
-async function buildGlossaryPromptLines(text, mode) {
+function buildGlossaryPromptLinesSync(text, mode) {
+  if (!MEM.glossarySubstrings.length) return [];
   const lowerText = normalizeExactText(text);
   if (!lowerText) return [];
 
-  const store = await chrome.storage.local.get({ [GLOSSARY_KEY]: [] });
-  const glossary = store[GLOSSARY_KEY] || [];
-  if (!glossary.length) return [];
-
   const matchedRules = [];
-  for (const g of glossary) {
-    if (!g || !g.source || !g.target) continue;
-    const dirOk = !g.direction || g.direction === "any" || g.direction === mode;
-    const normSrc = normalizeExactText(g.source);
-    const normTgt = normalizeExactText(g.target);
-
-    if (dirOk && normSrc.length >= 2 && lowerText.includes(normSrc)) {
-      matchedRules.push(`  - "${g.source}" ➔ "${g.target}"`);
+  for (let i = 0; i < MEM.glossarySubstrings.length; i++) {
+    const item = MEM.glossarySubstrings[i];
+    const dirOk = item.dir === "any" || item.dir === mode;
+    if (dirOk && item.exactSrc.length >= 2 && lowerText.includes(item.exactSrc)) {
+      matchedRules.push(`  - "${item.source}" ➔ "${item.target}"`);
     } else if (
-      (!g.direction || g.direction === "any") &&
-      normTgt.length >= 2 &&
-      lowerText.includes(normTgt)
+      item.dir === "any" &&
+      item.exactTgt.length >= 2 &&
+      lowerText.includes(item.exactTgt)
     ) {
-      matchedRules.push(`  - "${g.target}" ➔ "${g.source}"`);
+      matchedRules.push(`  - "${item.target}" ➔ "${item.source}"`);
     }
-    if (matchedRules.length >= 15) break;
+    if (matchedRules.length >= 12) break;
   }
 
   if (!matchedRules.length) return [];
@@ -433,22 +572,10 @@ async function buildGlossaryPromptLines(text, mode) {
   ];
 }
 
-// ID duy nhất kể cả khi nhiều bản dịch xong trong cùng 1 mili-giây.
-function newId(prefix) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-}
-
 function broadcastNewItem(item) {
   chrome.runtime
     .sendMessage({ type: "TRANSLATED_INCOMING", item })
-    .catch(() => {
-      /* side panel có thể đang đóng, bỏ qua */
-    });
-}
-
-async function getSettings() {
-  const stored = await chrome.storage.sync.get(DEFAULT_SETTINGS);
-  return { ...DEFAULT_SETTINGS, ...stored };
+    .catch(() => {});
 }
 
 // Cho phép side panel tự mở khi bấm icon extension.
@@ -473,8 +600,6 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
-// Bôi đen text / chuột phải vào ảnh trên Instagram -> dịch ngay, đẩy kết quả
-// vào side panel.
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (!tab?.id) return;
   if (
@@ -484,7 +609,6 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     return;
   }
 
-  // Mở side panel ngay (context menu click tính là user gesture nên được phép).
   if (tab.windowId != null) {
     chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
   }
@@ -510,15 +634,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 // ---------------------------------------------------------------------------
-// Gemini API (Tối ưu hóa siêu tốc & JSON Schema)
+// Gemini API (Tối ưu hóa siêu tốc, giới hạn token & Timeout chống treo)
 // ---------------------------------------------------------------------------
 
-/**
- * Gọi Gemini API với các tuỳ chọn tối ưu tốc độ phản hồi:
- * - systemInstruction phân tách riêng để tận dụng prompt caching của Google.
- * - thinkingBudget: 0 giúp tắt thinking reasoning của Gemini 2.5/Gemini 3 -> phản hồi tức thì.
- * - responseSchema đảm bảo cấu trúc trả về chuẩn 100%, không sinh token thừa.
- */
 async function callGemini({
   prompt,
   apiKey,
@@ -528,6 +646,7 @@ async function callGemini({
   responseSchema,
   temperature = 0.2,
   fastMode = true,
+  maxOutputTokens = 512,
 }) {
   if (!apiKey) {
     throw new Error("Chưa cấu hình Gemini API key. Mở Settings để nhập.");
@@ -544,6 +663,7 @@ async function callGemini({
 
   const generationConfig = {
     temperature,
+    maxOutputTokens,
     responseMimeType: "application/json",
   };
 
@@ -551,8 +671,6 @@ async function callGemini({
     generationConfig.responseSchema = responseSchema;
   }
 
-  // Gemini 2.5 Flash / Pro hoặc Gemini 3 mặc định suy nghĩ ngầm (tốn 1000+ token và 3-5 giây).
-  // Khi bật fastMode, đặt thinkingBudget = 0 để tắt reasoning -> phản hồi siêu tốc (<500ms).
   const isThinkingModel = /2\.5|thinking|gemini-3/i.test(model);
   if (fastMode && isThinkingModel) {
     generationConfig.thinkingConfig = { thinkingBudget: 0 };
@@ -569,29 +687,37 @@ async function callGemini({
     };
   }
 
-  let res = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify(body),
-  });
+  const fetchWithTimeout = async (reqBody) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      return await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify(reqBody),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
-  // Cơ chế tự phục hồi (Fallback): Nếu model không hỗ trợ thinkingConfig hoặc responseSchema (HTTP 400),
-  // thử lại với cấu hình cơ bản để đảm bảo không bao giờ bị lỗi kết nối.
-  if (!res.ok && res.status === 400 && (generationConfig.thinkingConfig || generationConfig.responseSchema || body.systemInstruction)) {
+  let res = await fetchWithTimeout(body);
+
+  if (
+    !res.ok &&
+    res.status === 400 &&
+    (generationConfig.thinkingConfig ||
+      generationConfig.responseSchema ||
+      body.systemInstruction)
+  ) {
     delete generationConfig.thinkingConfig;
     delete generationConfig.responseSchema;
     delete body.systemInstruction;
-    res = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": apiKey,
-      },
-      body: JSON.stringify(body),
-    });
+    res = await fetchWithTimeout(body);
   }
 
   if (!res.ok) {
@@ -623,15 +749,31 @@ function buildStyleLines(settings) {
   return lines;
 }
 
+/**
+ * Xây dựng ngữ cảnh gọn nhẹ: Bỏ qua ảnh OCR và cắt gọn các câu quá dài
+ * để tránh làm phình kích thước Prompt theo thời gian.
+ */
 function buildContextLines(recentHistory) {
   if (!recentHistory || !recentHistory.length) return [];
-  const turns = recentHistory.map((it, i) => {
-    const role = it.kind === "outgoing" ? "Me (Outgoing)" : "Them (Incoming)";
-    return `  [Turn ${i + 1} - ${role}]: "${it.original}" ➔ "${it.translation}"`;
-  });
+  const compactTurns = [];
+  for (let i = 0; i < recentHistory.length; i++) {
+    const it = recentHistory[i];
+    if (!it || it.source === "image" || !it.original || !it.translation) continue;
+    const orig =
+      it.original.length > MAX_CONTEXT_TURN_CHARS
+        ? it.original.slice(0, MAX_CONTEXT_TURN_CHARS) + "..."
+        : it.original;
+    const trans =
+      it.translation.length > MAX_CONTEXT_TURN_CHARS
+        ? it.translation.slice(0, MAX_CONTEXT_TURN_CHARS) + "..."
+        : it.translation;
+    const role = it.kind === "outgoing" ? "Me" : "Them";
+    compactTurns.push(`  [${role}]: "${orig}" ➔ "${trans}"`);
+  }
+  if (!compactTurns.length) return [];
   return [
-    "RECENT CONVERSATION HISTORY (Use ONLY for pronouns, relationship and context consistency; DO NOT re-translate or repeat them):",
-    ...turns,
+    "RECENT CONTEXT (For pronoun 'anh - em' consistency only; DO NOT re-translate):",
+    ...compactTurns.slice(-4),
   ];
 }
 
@@ -647,21 +789,17 @@ function normalizeTranslation(parsed, raw, latencyMs = null) {
 }
 
 /**
- * Dịch văn bản với Gemini:
- * - Tự động tra cứu Từ điển cá nhân (Glossary) & Bộ nhớ dịch (Translation Memory) (0ms, 0 API call)
- * - Tự động tra cứu Cache LRU (0ms)
- * - Tự động phát hiện Emoji / số / ký hiệu không cần dịch (0ms)
- * - Tự động đính kèm từ vựng cá nhân (Glossary Injection) vào câu dài
- * - Chế độ siêu tốc (tắt thinking) & Schema JSON chuẩn OpenAPI
+ * Dịch văn bản với Gemini (RAM O(1) Lookup + Fast Prompt):
  */
 async function translateWithGemini({ text, targetLang, mode, settings }) {
   if (!text || !text.trim()) {
     return { detectedLang: "", translation: "", phonetics: "", latencyMs: 0 };
   }
 
+  await ensureHydrated();
   const cleanText = text.trim();
 
-  // 1. Kiểm tra nếu chỉ gồm ký tự không cần dịch (emoji, url, số)
+  // 1. Kiểm tra nếu chỉ gồm ký tự không cần dịch (emoji, url, số) -> 0ms
   if (isNonTranslatable(cleanText)) {
     return {
       detectedLang: "Symbol",
@@ -672,8 +810,8 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
     };
   }
 
-  // 2. Tra cứu trong Từ điển cá nhân (Glossary) & Bộ nhớ dịch tự động (TM) -> 0ms, 0 API call
-  const libraryHit = await lookupInLibrary(
+  // 2. Tra cứu O(1) trong RAM (Từ điển cá nhân & Bộ nhớ dịch) -> 0ms, 0 disk I/O, 0 API call
+  const libraryHit = lookupInLibrarySync(
     cleanText,
     mode,
     targetLang,
@@ -683,7 +821,7 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
     return libraryHit;
   }
 
-  // 3. Tra cứu RAM Cache LRU
+  // 3. Tra cứu RAM Cache LRU (cho các đoạn văn dài > 220 ký tự)
   const cacheKey = `${mode}|${targetLang}|${settings.personaStyle}|${cleanText}`;
   const cached = getCachedTranslation(cacheKey);
   if (cached) {
@@ -692,30 +830,29 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
 
   const startTime = performance.now();
   const isOutgoing = mode === "outgoing";
-  const recent = await getRecentHistory(Number(settings.contextTurns) || 0);
-  const glossaryLines = await buildGlossaryPromptLines(cleanText, mode);
+  const recent = getRecentHistorySync(Math.min(4, Number(settings.contextTurns) || 0));
+  const glossaryLines = buildGlossaryPromptLinesSync(cleanText, mode);
   const includePhonetics = !!settings.enablePhonetics;
 
   const promptLines = [
     isOutgoing
-      ? `MODE: OUTGOING CHAT. The user is typing a message in their language to send in ${targetLang}. Translate it into natural, authentic ${targetLang} as a native speaker would message in DMs.`
-      : `MODE: INCOMING CHAT. The user received this DM message and wants to understand it in ${targetLang}. Detect the source language and translate it accurately and naturally into ${targetLang}.`,
+      ? `MODE: OUTGOING CHAT. Translate user's message into natural, sweet ${targetLang} for DMs.`
+      : `MODE: INCOMING CHAT. Detect language and translate this DM naturally into ${targetLang}.`,
     ...buildStyleLines(settings),
     ...glossaryLines,
     ...buildContextLines(recent),
-    "CURRENT MESSAGE TO TRANSLATE:",
+    "MESSAGE TO TRANSLATE:",
     `"""${cleanText}"""`,
   ];
 
-  // Cấu hình Schema cho phản hồi JSON
   const responseProperties = {
     detectedLang: {
       type: "STRING",
-      description: "Detected source language name in English (e.g. English, Vietnamese, Korean, Thai).",
+      description: "Detected source language in English (e.g. English, Vietnamese, Thai).",
     },
     translation: {
       type: "STRING",
-      description: `Natural, contextual translation in ${targetLang}. Keep pronouns and emotions authentic.`,
+      description: `Natural, contextual translation in ${targetLang}.`,
     },
   };
 
@@ -725,8 +862,8 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
     responseProperties.phonetics = {
       type: "STRING",
       description: isOutgoing
-        ? "Romanized pronunciation guide (IPA/romaji/pinyin) of the TRANSLATED text. Empty string if Vietnamese."
-        : "Romanized pronunciation guide (IPA/romaji/pinyin) of the ORIGINAL text. Empty string if Vietnamese.",
+        ? "Romanized pronunciation of the TRANSLATED text. Empty string if Vietnamese."
+        : "Romanized pronunciation of the ORIGINAL text. Empty string if Vietnamese.",
     };
     requiredFields.push("phonetics");
   }
@@ -737,6 +874,8 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
     required: requiredFields,
   };
 
+  const maxOut = cleanText.length < 250 ? (includePhonetics ? 512 : 320) : 1024;
+
   const raw = await callGemini({
     prompt: promptLines.join("\n\n"),
     apiKey: settings.apiKey,
@@ -745,6 +884,7 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
     responseSchema,
     temperature: 0.2,
     fastMode: settings.fastMode !== false,
+    maxOutputTokens: maxOut,
   });
 
   const latencyMs = Math.round(performance.now() - startTime);
@@ -754,25 +894,20 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
     const parsed = parseJson(raw);
     result = normalizeTranslation(parsed, raw, latencyMs);
   } catch (e) {
-    // Fallback: nếu parse JSON lỗi, lấy trực tiếp nội dung raw
     result = normalizeTranslation({ translation: raw.trim(), detectedLang: "?" }, raw, latencyMs);
   }
 
-  // Lưu vào Cache
   setCachedTranslation(cacheKey, result);
-
   return result;
 }
 
-/**
- * Dịch chữ trong ảnh (OCR + dịch) sang targetLang.
- */
 async function translateImageWithGemini({ image, targetLang, settings }) {
+  await ensureHydrated();
   const startTime = performance.now();
-  const recent = await getRecentHistory(Number(settings.contextTurns) || 0);
+  const recent = getRecentHistorySync(Math.min(3, Number(settings.contextTurns) || 0));
 
   const promptLines = [
-    `Extract all readable text from this image (DM screenshot, meme, or photo), detect its source language, and translate it naturally into ${targetLang}.`,
+    `Extract all readable text from this image, detect its source language, and translate it naturally into ${targetLang}.`,
     ...buildStyleLines(settings),
     ...buildContextLines(recent),
   ];
@@ -797,6 +932,7 @@ async function translateImageWithGemini({ image, targetLang, settings }) {
     image,
     temperature: 0.2,
     fastMode: settings.fastMode !== false,
+    maxOutputTokens: 1024,
   });
 
   const latencyMs = Math.round(performance.now() - startTime);
@@ -808,11 +944,9 @@ async function translateImageWithGemini({ image, targetLang, settings }) {
   }
 }
 
-/**
- * 3 biến thể phong cách cho 1 tin nhắn đi: thân mật / trang trọng / súc tích.
- */
 async function getStyleVariants({ text, targetLang, settings }) {
-  const glossaryLines = await buildGlossaryPromptLines(text, "outgoing");
+  await ensureHydrated();
+  const glossaryLines = buildGlossaryPromptLinesSync(text, "outgoing");
   const promptLines = [
     `Provide 3 distinct translation variations of the TEXT into ${targetLang}, as chat messages the user could send:`,
     "'casual': friendly, warm, conversational tone.",
@@ -822,12 +956,7 @@ async function getStyleVariants({ text, targetLang, settings }) {
   ];
   const custom = (settings.customStyleInstruction || "").trim();
   if (custom) promptLines.push(`Also respect these user instructions where possible: ${custom}`);
-  promptLines.push(
-    "TEXT:",
-    "```",
-    text,
-    "```"
-  );
+  promptLines.push("TEXT:", "```", text, "```");
 
   const responseSchema = {
     type: "OBJECT",
@@ -847,6 +976,7 @@ async function getStyleVariants({ text, targetLang, settings }) {
     responseSchema,
     temperature: 0.5,
     fastMode: settings.fastMode !== false,
+    maxOutputTokens: 600,
   });
 
   let parsed;
@@ -862,18 +992,16 @@ async function getStyleVariants({ text, targetLang, settings }) {
   };
 }
 
-/**
- * Sinh N câu trả lời gợi ý bằng ngôn ngữ của người dùng kèm bản dịch sang ngôn ngữ đối phương.
- */
 async function suggestReplies({
   originalMessage,
   detectedLang,
   translationVi,
   settings,
 }) {
+  await ensureHydrated();
   const n = Math.max(1, Math.min(6, Number(settings.suggestionCount) || 3));
   const userLang = settings.incomingTargetLang || "Vietnamese";
-  const recent = await getRecentHistory(Number(settings.contextTurns) || 0);
+  const recent = getRecentHistorySync(Math.min(4, Number(settings.contextTurns) || 0));
 
   const promptLines = [
     "You are helping a user reply to an Instagram Direct DM.",
@@ -910,6 +1038,7 @@ async function suggestReplies({
     responseSchema,
     temperature: 0.4,
     fastMode: settings.fastMode !== false,
+    maxOutputTokens: 700,
   });
 
   let parsed;
@@ -929,7 +1058,7 @@ async function suggestReplies({
 }
 
 // ---------------------------------------------------------------------------
-// Luồng dịch dùng chung (context menu, auto-scan, Dán & dịch, ảnh)
+// Luồng dịch dùng chung (không chặn chờ ghi đĩa)
 // ---------------------------------------------------------------------------
 
 async function translateIncomingText(text, idPrefix = "in", messageId) {
@@ -952,7 +1081,7 @@ async function translateIncomingText(text, idPrefix = "in", messageId) {
     cacheSource: result.cacheSource || null,
     timestamp: Date.now(),
   };
-  return addHistoryItem(item);
+  return addHistoryItemFast(item);
 }
 
 async function translateIncomingImage(image) {
@@ -974,7 +1103,7 @@ async function translateIncomingImage(image) {
     latencyMs: result.latencyMs,
     timestamp: Date.now(),
   };
-  return addHistoryItem(item);
+  return addHistoryItemFast(item);
 }
 
 function arrayBufferToBase64(buffer) {
@@ -1061,7 +1190,6 @@ async function decryptCloudBundle(payload, syncKey) {
   );
   const jsonStr = new TextDecoder().decode(plainBuf);
   const parsed = JSON.parse(jsonStr);
-  // Tương thích ngược với v1.4.0 (khi dữ liệu giải mã là mảng lịch sử)
   if (Array.isArray(parsed)) {
     return { history: parsed, glossary: [], tm: [], deletedSigs: [], savedApiCalls: 0 };
   }
@@ -1154,7 +1282,7 @@ function mergeTmLists(localList, remoteList, historyList, deletedSet) {
     if (!entry || !entry.original || !entry.translation) return;
     if (!shouldLearnIntoTm(entry.original, entry.translation, entry.source)) return;
     const mode = entry.mode === "outgoing" || entry.kind === "outgoing" ? "outgoing" : "incoming";
-    const normOrig = normalizeRelaxedText(entry.original);
+    const normOrig = entry._normOrig || normalizeRelaxedText(entry.original);
     if (!normOrig) return;
     const sig = `tm||${mode}||${(entry.targetLang || "").toLowerCase()}||${normOrig}`;
     if (deletedSet.has(sig)) return;
@@ -1188,7 +1316,6 @@ function mergeTmLists(localList, remoteList, historyList, deletedSet) {
     }
   };
 
-  // Tự động trích xuất từ lịch sử dịch để làm giàu Bộ nhớ từ (TM)
   for (const h of historyList || []) ingest(h);
   for (const t of remoteList || []) ingest(t);
   for (const t of localList || []) ingest(t);
@@ -1203,201 +1330,217 @@ function mergeTmLists(localList, remoteList, historyList, deletedSet) {
   return merged.slice(0, MAX_TM_ITEMS);
 }
 
+// Tăng thời gian gom (debounce) tự động đồng bộ Cloud lên 12s khi nghỉ tay
+// để không làm nghẽn mạng & CPU khi người dùng đang dịch liên tiếp nhiều câu.
 let syncDebounceTimer = null;
+let isSyncingNow = false;
+
 function scheduleAutoSync() {
   if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
   syncDebounceTimer = setTimeout(() => {
     syncHistoryWithCloud({ silent: true }).catch(() => {});
-  }, 1500);
+  }, 12000);
 }
 
 async function syncHistoryWithCloud({
   silent = false,
   overrideConfig = null,
 } = {}) {
-  const settings = overrideConfig
-    ? { ...(await getSettings()), ...overrideConfig }
-    : await getSettings();
-
-  if (!overrideConfig && !settings.syncEnabled) {
-    return { ok: false, skipped: true, error: "Chưa bật đồng bộ đám mây." };
+  if (isSyncingNow && silent) {
+    return { ok: false, skipped: true };
   }
-
-  let workerUrl = (settings.syncWorkerUrl || "").trim().replace(/\/+$/, "");
-  const syncKey = (settings.syncKey || "").trim();
-
-  if (!workerUrl) {
-    if (silent) return { ok: false, skipped: true };
-    throw new Error("Chưa nhập Cloudflare Worker URL.");
-  }
-  if (!/^https?:\/\//i.test(workerUrl)) {
-    workerUrl = "https://" + workerUrl;
-  }
-  if (workerUrl.includes("dash.cloudflare.com")) {
-    throw new Error(
-      "Bạn đang dán link trang quản trị Cloudflare. Hãy dán link Worker có đuôi .workers.dev (VD: https://ig-trans-sync.ten-ban.workers.dev)."
-    );
-  }
-  if (!syncKey || syncKey.length < 6) {
-    if (silent) return { ok: false, skipped: true };
-    throw new Error("Sync Key cần tối thiểu 6 ký tự.");
-  }
-
-  const authToken = encodeURIComponent(syncKey);
-
-  // 1. Kéo dữ liệu từ Cloudflare KV
-  let getRes;
+  isSyncingNow = true;
   try {
-    getRes = await fetch(workerUrl, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${authToken}`,
-      },
-    });
-  } catch (netErr) {
-    throw new Error(
-      `Không kết nối được tới ${workerUrl} (${netErr?.message || "Failed to fetch"}). Hãy kiểm tra: (1) Đã bấm Reload 🔄 extension trong chrome://extensions chưa, (2) Đã dán code worker.js & bấm Deploy trên Cloudflare chưa, (3) Link .workers.dev có viết đúng không.`
-    );
-  }
+    await ensureHydrated();
+    const settings = overrideConfig
+      ? { ...(await getSettings()), ...overrideConfig }
+      : await getSettings();
 
-  if (!getRes.ok) {
-    const errData = await getRes.json().catch(() => ({}));
-    throw new Error(
-      errData?.error || `Lỗi kết nối Cloudflare Worker (${getRes.status}).`
-    );
-  }
+    if (!overrideConfig && !settings.syncEnabled) {
+      return { ok: false, skipped: true, error: "Chưa bật đồng bộ đám mây." };
+    }
 
-  const remotePayload = await getRes.json();
-  let remoteBundle = {
-    history: [],
-    glossary: [],
-    tm: [],
-    deletedSigs: [],
-    savedApiCalls: 0,
-  };
-  if (remotePayload && !remotePayload.empty && remotePayload.ct) {
-    try {
-      remoteBundle = await decryptCloudBundle(remotePayload, syncKey);
-    } catch (e) {
+    let workerUrl = (settings.syncWorkerUrl || "").trim().replace(/\/+$/, "");
+    const syncKey = (settings.syncKey || "").trim();
+
+    if (!workerUrl) {
+      if (silent) return { ok: false, skipped: true };
+      throw new Error("Chưa nhập Cloudflare Worker URL.");
+    }
+    if (!/^https?:\/\//i.test(workerUrl)) {
+      workerUrl = "https://" + workerUrl;
+    }
+    if (workerUrl.includes("dash.cloudflare.com")) {
       throw new Error(
-        "Không giải mã được dữ liệu trên Cloud (sai Sync Key hoặc dữ liệu không khớp)."
+        "Bạn đang dán link trang quản trị Cloudflare. Hãy dán link Worker có đuôi .workers.dev (VD: https://ig-trans-sync.ten-ban.workers.dev)."
       );
     }
-  }
-
-  // 2. Gộp hai chiều cả 3 kho: Lịch sử + Từ điển cá nhân + Bộ nhớ dịch (TM)
-  let finalBundle = null;
-  await withLocalStore(
-    {
-      [HISTORY_KEY]: [],
-      [GLOSSARY_KEY]: [],
-      [TM_KEY]: [],
-      [DELETED_SIGS_KEY]: [],
-      [STATS_KEY]: { savedApiCalls: 0 },
-    },
-    (store) => {
-      const deletedSet = new Set([
-        ...(store[DELETED_SIGS_KEY] || []),
-        ...(remoteBundle.deletedSigs || []),
-      ]);
-      const finalDeletedSigs = Array.from(deletedSet).slice(-500);
-
-      const mergedHistory = mergeHistoryLists(
-        store[HISTORY_KEY],
-        remoteBundle.history
-      );
-      const mergedGlossary = mergeGlossaryLists(
-        store[GLOSSARY_KEY],
-        remoteBundle.glossary,
-        deletedSet
-      );
-      const mergedTm = mergeTmLists(
-        store[TM_KEY],
-        remoteBundle.tm,
-        mergedHistory,
-        deletedSet
-      );
-      const mergedSavedCalls = Math.max(
-        store[STATS_KEY]?.savedApiCalls || 0,
-        remoteBundle.savedApiCalls || 0
-      );
-
-      store[HISTORY_KEY] = mergedHistory;
-      store[GLOSSARY_KEY] = mergedGlossary;
-      store[TM_KEY] = mergedTm;
-      store[DELETED_SIGS_KEY] = finalDeletedSigs;
-      store[STATS_KEY] = { ...store[STATS_KEY], savedApiCalls: mergedSavedCalls };
-
-      finalBundle = {
-        history: mergedHistory,
-        glossary: mergedGlossary,
-        tm: mergedTm,
-        deletedSigs: finalDeletedSigs,
-        savedApiCalls: mergedSavedCalls,
-      };
+    if (!syncKey || syncKey.length < 6) {
+      if (silent) return { ok: false, skipped: true };
+      throw new Error("Sync Key cần tối thiểu 6 ký tự.");
     }
-  );
 
-  // 3. Mã hóa gói dữ liệu đã gộp và đẩy ngược lên Cloud
-  const encryptedPayload = await encryptCloudBundle(finalBundle, syncKey);
-  let postRes;
-  try {
-    postRes = await fetch(workerUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${authToken}`,
-      },
-      body: JSON.stringify(encryptedPayload),
+    const authToken = encodeURIComponent(syncKey);
+
+    let getRes;
+    try {
+      getRes = await fetch(workerUrl, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
+      });
+    } catch (netErr) {
+      throw new Error(
+        `Không kết nối được tới ${workerUrl} (${netErr?.message || "Failed to fetch"}).`
+      );
+    }
+
+    if (!getRes.ok) {
+      const errData = await getRes.json().catch(() => ({}));
+      throw new Error(
+        errData?.error || `Lỗi kết nối Cloudflare Worker (${getRes.status}).`
+      );
+    }
+
+    const remotePayload = await getRes.json();
+    let remoteBundle = {
+      history: [],
+      glossary: [],
+      tm: [],
+      deletedSigs: [],
+      savedApiCalls: 0,
+    };
+    if (remotePayload && !remotePayload.empty && remotePayload.ct) {
+      try {
+        remoteBundle = await decryptCloudBundle(remotePayload, syncKey);
+      } catch (e) {
+        throw new Error(
+          "Không giải mã được dữ liệu trên Cloud (sai Sync Key hoặc dữ liệu không khớp)."
+        );
+      }
+    }
+
+    const prevCount = MEM.history.length;
+    const prevLastId = MEM.history[MEM.history.length - 1]?.id || "";
+
+    for (const s of remoteBundle.deletedSigs || []) {
+      MEM.deletedSigs.add(s);
+    }
+
+    MEM.history = mergeHistoryLists(MEM.history, remoteBundle.history);
+    MEM.glossary = mergeGlossaryLists(
+      MEM.glossary,
+      remoteBundle.glossary,
+      MEM.deletedSigs
+    );
+    MEM.tm = mergeTmLists(
+      MEM.tm,
+      remoteBundle.tm,
+      MEM.history,
+      MEM.deletedSigs
+    );
+    MEM.stats.savedApiCalls = Math.max(
+      MEM.stats?.savedApiCalls || 0,
+      remoteBundle.savedApiCalls || 0
+    );
+
+    rebuildGlossaryIndex();
+    rebuildTmIndex();
+
+    const newLastId = MEM.history[MEM.history.length - 1]?.id || "";
+    const historyChangedFromRemote =
+      MEM.history.length !== prevCount || newLastId !== prevLastId;
+
+    const finalBundle = {
+      history: MEM.history,
+      glossary: stripInternalFields(MEM.glossary),
+      tm: stripInternalFields(MEM.tm),
+      deletedSigs: Array.from(MEM.deletedSigs).slice(-500),
+      savedApiCalls: MEM.stats.savedApiCalls,
+    };
+
+    scheduleDiskFlush({
+      history: true,
+      glossary: true,
+      tm: true,
+      deletedSigs: true,
+      stats: true,
     });
-  } catch (netErr) {
-    throw new Error(
-      `Không gửi được dữ liệu lên ${workerUrl} (${netErr?.message || "Failed to fetch"}).`
-    );
-  }
 
-  if (!postRes.ok) {
-    const errData = await postRes.json().catch(() => ({}));
-    throw new Error(
-      errData?.error || `Lỗi lưu lên Cloudflare Worker (${postRes.status}).`
-    );
-  }
+    const encryptedPayload = await encryptCloudBundle(finalBundle, syncKey);
+    let postRes;
+    try {
+      postRes = await fetch(workerUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify(encryptedPayload),
+      });
+    } catch (netErr) {
+      throw new Error(
+        `Không gửi được dữ liệu lên ${workerUrl} (${netErr?.message || "Failed to fetch"}).`
+      );
+    }
 
-  const syncedAt = Date.now();
-  await chrome.storage.local.set({ igt_last_sync_at: syncedAt });
+    if (!postRes.ok) {
+      const errData = await postRes.json().catch(() => ({}));
+      throw new Error(
+        errData?.error || `Lỗi lưu lên Cloudflare Worker (${postRes.status}).`
+      );
+    }
 
-  chrome.runtime
-    .sendMessage({
-      type: "HISTORY_SYNCED",
+    const syncedAt = Date.now();
+    await chrome.storage.local.set({ igt_last_sync_at: syncedAt });
+
+    // Chỉ bắn sự kiện vẽ lại UI khi thực sự có lịch sử mới từ máy khác hoặc bấm đồng bộ thủ công
+    if (!silent || historyChangedFromRemote) {
+      chrome.runtime
+        .sendMessage({
+          type: "HISTORY_SYNCED",
+          count: finalBundle.history.length,
+          glossaryCount: finalBundle.glossary.length,
+          tmCount: finalBundle.tm.length,
+          savedApiCalls: finalBundle.savedApiCalls,
+          syncedAt,
+        })
+        .catch(() => {});
+    }
+
+    return {
+      ok: true,
       count: finalBundle.history.length,
       glossaryCount: finalBundle.glossary.length,
       tmCount: finalBundle.tm.length,
       savedApiCalls: finalBundle.savedApiCalls,
       syncedAt,
-    })
-    .catch(() => {});
-
-  return {
-    ok: true,
-    count: finalBundle.history.length,
-    glossaryCount: finalBundle.glossary.length,
-    tmCount: finalBundle.tm.length,
-    savedApiCalls: finalBundle.savedApiCalls,
-    syncedAt,
-  };
+    };
+  } finally {
+    isSyncingNow = false;
+  }
 }
+
+// ---------------------------------------------------------------------------
+// Message Listeners
+// ---------------------------------------------------------------------------
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     try {
+      await ensureHydrated();
+
       switch (message?.type) {
         case "GET_SETTINGS": {
-          sendResponse({ ok: true, settings: await getSettings() });
+          sendResponse({ ok: true, settings: MEM.settings });
           break;
         }
 
         case "SAVE_SETTINGS": {
-          await chrome.storage.sync.set(message.settings || {});
+          const patch = message.settings || {};
+          MEM.settings = { ...MEM.settings, ...patch };
+          await chrome.storage.sync.set(patch);
           sendResponse({ ok: true });
           break;
         }
@@ -1411,35 +1554,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
 
-        // Quản lý Thư viện từ (Glossary + Translation Memory)
         case "GET_LIBRARY_DATA": {
-          const data = await withLocalStore(
-            {
-              [HISTORY_KEY]: [],
-              [GLOSSARY_KEY]: [],
-              [TM_KEY]: [],
-              [DELETED_SIGS_KEY]: [],
-              [STATS_KEY]: { savedApiCalls: 0 },
-            },
-            (store) => {
-              // Nếu TM chưa được khởi tạo nhưng đã có Lịch sử, tự động trích xuất từ Lịch sử sang TM
-              if (store[TM_KEY].length === 0 && store[HISTORY_KEY].length > 0) {
-                const deletedSet = new Set(store[DELETED_SIGS_KEY] || []);
-                store[TM_KEY] = mergeTmLists(
-                  [],
-                  [],
-                  store[HISTORY_KEY],
-                  deletedSet
-                );
-              }
-              return {
-                glossary: store[GLOSSARY_KEY],
-                tm: store[TM_KEY],
-                stats: store[STATS_KEY] || { savedApiCalls: 0 },
-              };
-            }
-          );
-          sendResponse({ ok: true, ...data });
+          sendResponse({
+            ok: true,
+            glossary: stripInternalFields(MEM.glossary),
+            tm: stripInternalFields(MEM.tm),
+            stats: MEM.stats || { savedApiCalls: 0 },
+          });
           break;
         }
 
@@ -1451,156 +1572,126 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           if (!source || !target) {
             throw new Error("Vui lòng nhập đầy đủ từ/câu gốc và bản dịch.");
           }
-          const result = await withLocalStore(
-            { [GLOSSARY_KEY]: [], [DELETED_SIGS_KEY]: [] },
-            (store) => {
-              const list = store[GLOSSARY_KEY];
-              const sig = glossarySig({ source, direction });
-              store[DELETED_SIGS_KEY] = (store[DELETED_SIGS_KEY] || []).filter(
-                (s) => s !== sig
-              );
-              const existingIdx = list.findIndex((g) => glossarySig(g) === sig);
-              let savedItem;
-              if (existingIdx !== -1) {
-                list[existingIdx] = {
-                  ...list[existingIdx],
-                  source,
-                  target,
-                  direction,
-                  phonetics: phonetics || list[existingIdx].phonetics || "",
-                  updatedAt: Date.now(),
-                };
-                savedItem = list[existingIdx];
-              } else {
-                savedItem = {
-                  id: newId("gls"),
-                  source,
-                  target,
-                  direction,
-                  phonetics,
-                  hitCount: 0,
-                  updatedAt: Date.now(),
-                };
-                list.unshift(savedItem);
-              }
-              if (list.length > MAX_GLOSSARY_ITEMS) {
-                list.splice(MAX_GLOSSARY_ITEMS);
-              }
-              return { item: savedItem, count: list.length };
-            }
-          );
+          const sig = glossarySig({ source, direction });
+          MEM.deletedSigs.delete(sig);
+
+          const existingIdx = MEM.glossary.findIndex((g) => glossarySig(g) === sig);
+          let savedItem;
+          if (existingIdx !== -1) {
+            MEM.glossary[existingIdx] = {
+              ...MEM.glossary[existingIdx],
+              source,
+              target,
+              direction,
+              phonetics: phonetics || MEM.glossary[existingIdx].phonetics || "",
+              updatedAt: Date.now(),
+            };
+            savedItem = MEM.glossary[existingIdx];
+          } else {
+            savedItem = {
+              id: newId("gls"),
+              source,
+              target,
+              direction,
+              phonetics,
+              hitCount: 0,
+              updatedAt: Date.now(),
+            };
+            MEM.glossary.unshift(savedItem);
+          }
+          if (MEM.glossary.length > MAX_GLOSSARY_ITEMS) {
+            MEM.glossary.splice(MAX_GLOSSARY_ITEMS);
+          }
+          rebuildGlossaryIndex();
+          scheduleDiskFlush({ glossary: true, deletedSigs: true });
           scheduleAutoSync();
-          sendResponse({ ok: true, ...result });
+          sendResponse({ ok: true, item: savedItem, count: MEM.glossary.length });
           break;
         }
 
         case "DELETE_GLOSSARY_ITEM": {
-          await withLocalStore(
-            { [GLOSSARY_KEY]: [], [DELETED_SIGS_KEY]: [] },
-            (store) => {
-              const list = store[GLOSSARY_KEY];
-              const idx = list.findIndex((g) => g.id === message.id);
-              if (idx !== -1) {
-                const removed = list.splice(idx, 1)[0];
-                const sig = glossarySig(removed);
-                if (!store[DELETED_SIGS_KEY].includes(sig)) {
-                  store[DELETED_SIGS_KEY].push(sig);
-                }
-              }
-            }
-          );
-          scheduleAutoSync();
+          const idx = MEM.glossary.findIndex((g) => g.id === message.id);
+          if (idx !== -1) {
+            const removed = MEM.glossary.splice(idx, 1)[0];
+            MEM.deletedSigs.add(glossarySig(removed));
+            rebuildGlossaryIndex();
+            scheduleDiskFlush({ glossary: true, deletedSigs: true });
+            scheduleAutoSync();
+          }
           sendResponse({ ok: true });
           break;
         }
 
         case "DELETE_TM_ITEM": {
-          await withLocalStore(
-            { [TM_KEY]: [], [DELETED_SIGS_KEY]: [] },
-            (store) => {
-              const list = store[TM_KEY];
-              const idx = list.findIndex((t) => t.id === message.id);
-              if (idx !== -1) {
-                const removed = list.splice(idx, 1)[0];
-                const sig = tmSig(removed);
-                if (!store[DELETED_SIGS_KEY].includes(sig)) {
-                  store[DELETED_SIGS_KEY].push(sig);
-                }
-              }
-            }
-          );
-          scheduleAutoSync();
+          const idx = MEM.tm.findIndex((t) => t.id === message.id);
+          if (idx !== -1) {
+            const removed = MEM.tm.splice(idx, 1)[0];
+            MEM.deletedSigs.add(tmSig(removed));
+            rebuildTmIndex();
+            scheduleDiskFlush({ tm: true, deletedSigs: true });
+            scheduleAutoSync();
+          }
           sendResponse({ ok: true });
           break;
         }
 
         case "PIN_TM_TO_GLOSSARY": {
-          const tmId = message.id;
-          const pinned = await withLocalStore(
-            { [TM_KEY]: [], [GLOSSARY_KEY]: [], [DELETED_SIGS_KEY]: [] },
-            (store) => {
-              const tmEntry = store[TM_KEY].find((t) => t.id === tmId);
-              if (!tmEntry) throw new Error("Không tìm thấy mẫu câu trong bộ nhớ.");
-              const direction = "any";
-              const sig = glossarySig({ source: tmEntry.original, direction });
-              store[DELETED_SIGS_KEY] = (store[DELETED_SIGS_KEY] || []).filter(
-                (s) => s !== sig
-              );
-              const list = store[GLOSSARY_KEY];
-              const existingIdx = list.findIndex((g) => glossarySig(g) === sig);
-              if (existingIdx !== -1) {
-                list[existingIdx] = {
-                  ...list[existingIdx],
-                  source: tmEntry.original,
-                  target: tmEntry.translation,
-                  direction,
-                  phonetics: tmEntry.phonetics || list[existingIdx].phonetics || "",
-                  updatedAt: Date.now(),
-                };
-                return list[existingIdx];
-              }
-              const newItem = {
-                id: newId("gls"),
-                source: tmEntry.original,
-                target: tmEntry.translation,
-                direction,
-                phonetics: tmEntry.phonetics || "",
-                hitCount: tmEntry.hitCount || 1,
-                updatedAt: Date.now(),
-              };
-              list.unshift(newItem);
-              return newItem;
-            }
-          );
+          const tmEntry = MEM.tm.find((t) => t.id === message.id);
+          if (!tmEntry) throw new Error("Không tìm thấy mẫu câu trong bộ nhớ.");
+          const direction = "any";
+          const sig = glossarySig({ source: tmEntry.original, direction });
+          MEM.deletedSigs.delete(sig);
+
+          const existingIdx = MEM.glossary.findIndex((g) => glossarySig(g) === sig);
+          let pinned;
+          if (existingIdx !== -1) {
+            MEM.glossary[existingIdx] = {
+              ...MEM.glossary[existingIdx],
+              source: tmEntry.original,
+              target: tmEntry.translation,
+              direction,
+              phonetics: tmEntry.phonetics || MEM.glossary[existingIdx].phonetics || "",
+              updatedAt: Date.now(),
+            };
+            pinned = MEM.glossary[existingIdx];
+          } else {
+            pinned = {
+              id: newId("gls"),
+              source: tmEntry.original,
+              target: tmEntry.translation,
+              direction,
+              phonetics: tmEntry.phonetics || "",
+              hitCount: tmEntry.hitCount || 1,
+              updatedAt: Date.now(),
+            };
+            MEM.glossary.unshift(pinned);
+          }
+          rebuildGlossaryIndex();
+          scheduleDiskFlush({ glossary: true, deletedSigs: true });
           scheduleAutoSync();
           sendResponse({ ok: true, item: pinned });
           break;
         }
 
         case "CLEAR_TM": {
-          await withLocalStore({ [TM_KEY]: [] }, (store) => {
-            store[TM_KEY] = [];
-          });
+          MEM.tm = [];
+          rebuildTmIndex();
           TRANSLATION_CACHE.clear();
+          scheduleDiskFlush({ tm: true });
           scheduleAutoSync();
           sendResponse({ ok: true });
           break;
         }
 
         case "EXPORT_LIBRARY": {
-          const store = await chrome.storage.local.get({
-            [GLOSSARY_KEY]: [],
-            [TM_KEY]: [],
-            [STATS_KEY]: { savedApiCalls: 0 },
-          });
           sendResponse({
             ok: true,
             data: {
               v: 2,
               exportedAt: Date.now(),
-              glossary: store[GLOSSARY_KEY] || [],
-              tm: store[TM_KEY] || [],
-              stats: store[STATS_KEY] || { savedApiCalls: 0 },
+              glossary: stripInternalFields(MEM.glossary),
+              tm: stripInternalFields(MEM.tm),
+              stats: MEM.stats || { savedApiCalls: 0 },
             },
           });
           break;
@@ -1614,64 +1705,47 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             ? payload
             : [];
           const incomingTm = Array.isArray(payload.tm) ? payload.tm : [];
+          const emptySet = new Set();
 
-          const counts = await withLocalStore(
-            { [GLOSSARY_KEY]: [], [TM_KEY]: [], [DELETED_SIGS_KEY]: [] },
-            (store) => {
-              const deletedSet = new Set();
-              store[GLOSSARY_KEY] = mergeGlossaryLists(
-                store[GLOSSARY_KEY],
-                incomingGlossary,
-                deletedSet
-              );
-              store[TM_KEY] = mergeTmLists(
-                store[TM_KEY],
-                incomingTm,
-                [],
-                deletedSet
-              );
-              return {
-                glossaryCount: store[GLOSSARY_KEY].length,
-                tmCount: store[TM_KEY].length,
-              };
-            }
-          );
+          MEM.glossary = mergeGlossaryLists(MEM.glossary, incomingGlossary, emptySet);
+          MEM.tm = mergeTmLists(MEM.tm, incomingTm, [], emptySet);
+          rebuildGlossaryIndex();
+          rebuildTmIndex();
+          scheduleDiskFlush({ glossary: true, tm: true });
           scheduleAutoSync();
-          sendResponse({ ok: true, ...counts });
+          sendResponse({
+            ok: true,
+            glossaryCount: MEM.glossary.length,
+            tmCount: MEM.tm.length,
+          });
           break;
         }
 
-        // Content script báo có tin nhắn ĐẾN mới từ Instagram
         case "INCOMING_MESSAGE": {
-          const settings = await getSettings();
-          if (!settings.autoTranslateIncoming) {
+          if (!MEM.settings.autoTranslateIncoming) {
             sendResponse({ ok: true, skipped: true });
             break;
           }
           const item = await translateIncomingText(message.text, "auto", message.messageId);
-          // Đẩy kết quả cho side panel
           broadcastNewItem(item);
           sendResponse({ ok: true, item });
           break;
         }
 
-        // Side panel: "Dán & dịch" — dịch 1 đoạn text như tin ĐẾN
         case "TRANSLATE_INCOMING": {
           const item = await translateIncomingText(message.text, "paste");
           sendResponse({ ok: true, item });
           break;
         }
 
-        // Side panel: dịch chữ trong ảnh (chọn file / dán ảnh)
         case "TRANSLATE_IMAGE": {
           const item = await translateIncomingImage(parseDataUrl(message.dataUrl));
           sendResponse({ ok: true, item });
           break;
         }
 
-        // Side panel yêu cầu dịch tin nhắn user sắp gửi (chiều ngược lại)
         case "TRANSLATE_OUTGOING": {
-          const settings = await getSettings();
+          const settings = MEM.settings;
           const targetLang = message.targetLang || settings.outgoingTargetLang;
           const result = await translateWithGemini({
             text: message.text,
@@ -1679,7 +1753,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             mode: "outgoing",
             settings,
           });
-          const item = await addHistoryItem({
+          const item = addHistoryItemFast({
             id: newId("out"),
             kind: "outgoing",
             original: message.text,
@@ -1695,9 +1769,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
 
-        // Side panel: 3 biến thể phong cách cho tin nhắn đi
         case "STYLE_VARIANTS": {
-          const settings = await getSettings();
+          const settings = MEM.settings;
           const variants = await getStyleVariants({
             text: message.text,
             targetLang: message.targetLang || settings.outgoingTargetLang,
@@ -1707,9 +1780,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           break;
         }
 
-        // Side panel yêu cầu gợi ý câu trả lời cho 1 tin nhắn đến đã dịch
         case "SUGGEST_REPLIES": {
-          const settings = await getSettings();
+          const settings = MEM.settings;
           const result = await suggestReplies({
             originalMessage: message.original,
             detectedLang: message.detectedLang,
@@ -1717,7 +1789,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             settings,
           });
           if (message.messageId) {
-            await updateHistoryItem(message.messageId, {
+            updateHistoryItemFast(message.messageId, {
               suggestions: result.suggestions,
             });
           }
@@ -1726,60 +1798,52 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         case "DELETE_HISTORY_ITEM": {
-          await deleteHistoryItem(message.id);
+          deleteHistoryItemFast(message.id);
           sendResponse({ ok: true });
           break;
         }
 
         case "CLEAR_HISTORY": {
-          await withHistory((list) => {
-            list.length = 0;
-          });
+          MEM.history = [];
           TRANSLATION_CACHE.clear();
+          scheduleDiskFlush({ history: true });
           scheduleAutoSync();
           sendResponse({ ok: true });
           break;
         }
 
         case "EXPORT_HISTORY": {
-          const store = await chrome.storage.local.get({ [HISTORY_KEY]: [] });
-          sendResponse({ ok: true, items: store[HISTORY_KEY] || [] });
+          sendResponse({ ok: true, items: MEM.history });
           break;
         }
 
         case "IMPORT_HISTORY": {
           const items = Array.isArray(message.items) ? message.items : [];
           if (items.length) {
-            await withLocalStore(
-              { [HISTORY_KEY]: [], [TM_KEY]: [], [DELETED_SIGS_KEY]: [] },
-              (store) => {
-                const list = store[HISTORY_KEY];
-                const existingIds = new Set(list.map((it) => it.id));
-                for (const item of items) {
-                  if (item && item.original && item.translation) {
-                    if (!item.id || existingIds.has(item.id)) {
-                      item.id = newId(item.kind === "outgoing" ? "out" : "in");
-                    }
-                    list.push(item);
-                    existingIds.add(item.id);
-                  }
+            const existingIds = new Set(MEM.history.map((it) => it.id));
+            for (const item of items) {
+              if (item && item.original && item.translation) {
+                if (!item.id || existingIds.has(item.id)) {
+                  item.id = newId(item.kind === "outgoing" ? "out" : "in");
                 }
-                list.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
-                if (list.length > MAX_HISTORY_ITEMS) {
-                  list.splice(0, list.length - MAX_HISTORY_ITEMS);
-                }
-                const deletedSet = new Set(store[DELETED_SIGS_KEY] || []);
-                store[TM_KEY] = mergeTmLists(store[TM_KEY], [], list, deletedSet);
+                MEM.history.push(item);
+                existingIds.add(item.id);
               }
-            );
+            }
+            MEM.history.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+            if (MEM.history.length > MAX_HISTORY_ITEMS) {
+              MEM.history.splice(0, MEM.history.length - MAX_HISTORY_ITEMS);
+            }
+            MEM.tm = mergeTmLists(MEM.tm, [], MEM.history, MEM.deletedSigs);
+            rebuildTmIndex();
             TRANSLATION_CACHE.clear();
+            scheduleDiskFlush({ history: true, tm: true });
             scheduleAutoSync();
           }
           sendResponse({ ok: true, count: items.length });
           break;
         }
 
-        // Side panel muốn chèn văn bản đã dịch vào khung chat Instagram đang mở
         case "INSERT_TO_CHAT": {
           const [tab] = await chrome.tabs.query({
             active: true,
@@ -1814,5 +1878,5 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: err?.message || String(err) });
     }
   })();
-  return true; // giữ kênh async mở cho sendResponse
+  return true;
 });

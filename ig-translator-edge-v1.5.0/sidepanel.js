@@ -52,6 +52,8 @@ const personaSelectEl = document.getElementById("personaSelect");
 const HISTORY_KEY = "igt_history";
 const FEED_CLEARED_KEY = "igt_feed_cleared_at";
 const MAX_IMAGE_SIDE = 1600;
+const MAX_FEED_CARDS = 60;
+const MAX_LIBRARY_RENDER = 150;
 
 let currentSettings = null;
 let outgoingLangQuickSelect = null;
@@ -59,6 +61,7 @@ let outgoingLangQuickSelect = null;
 let lastOutgoing = null;
 let activeLibraryTab = "glossary"; // "glossary" | "tm"
 let cachedLibraryData = { glossary: [], tm: [], stats: { savedApiCalls: 0 } };
+let searchDebounceTimer = null;
 
 function showStatus(msg, isError = false) {
   statusBarEl.textContent = msg;
@@ -70,10 +73,17 @@ function clearStatus() {
   statusBarEl.classList.add("hidden");
 }
 
+const HTML_ESCAPE_MAP = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
 function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str == null ? "" : str;
-  return div.innerHTML;
+  if (str == null) return "";
+  return String(str).replace(/[&<>"']/g, (ch) => HTML_ESCAPE_MAP[ch]);
 }
 
 function formatTime(ts) {
@@ -304,19 +314,38 @@ function buildOutgoingCard(item) {
   return card;
 }
 
+function computeCardSig(item) {
+  return `${item.kind || ""}\u0000${item.original || ""}\u0000${item.translation || ""}`;
+}
+
+function createCardElement(item) {
+  const card =
+    item.kind === "outgoing" ? buildOutgoingCard(item) : buildIncomingCard(item);
+  card.dataset.sig = computeCardSig(item);
+  return card;
+}
+
 function renderCard(item) {
   if (!item) return;
   emptyStateEl.classList.add("hidden");
-  // Lịch sử đã bỏ bản dịch trùng (cùng chiều, câu gốc, bản dịch) -> bỏ luôn
-  // thẻ cũ trùng trong feed cho khớp.
-  const sig = JSON.stringify([item.kind, item.original, item.translation]);
-  feedEl.querySelectorAll(".msg-card").forEach((c) => {
-    if (c.dataset.id === item.id || c.dataset.sig === sig) c.remove();
-  });
-  const card =
-    item.kind === "outgoing" ? buildOutgoingCard(item) : buildIncomingCard(item);
-  card.dataset.sig = sig;
+  const sig = computeCardSig(item);
+  const existingCards = feedEl.querySelectorAll(".msg-card");
+  for (const c of existingCards) {
+    if (c.dataset.id === item.id || c.dataset.sig === sig) {
+      c.remove();
+    }
+  }
+  const card = createCardElement(item);
   feedEl.appendChild(card);
+
+  // Giới hạn số thẻ trên khung live feed để DOM luôn nhẹ & phản hồi tức thì
+  const allCards = feedEl.querySelectorAll(".msg-card");
+  if (allCards.length > MAX_FEED_CARDS) {
+    const excess = allCards.length - MAX_FEED_CARDS;
+    for (let i = 0; i < excess; i++) {
+      allCards[i].remove();
+    }
+  }
   feedEl.scrollTop = feedEl.scrollHeight;
 }
 
@@ -326,18 +355,41 @@ function clearFeedUi() {
 }
 
 // Nạp lại feed từ lịch sử đã lưu (chỉ những mục sau lần "reload" gần nhất).
+// Gom toàn bộ vào DocumentFragment và chỉ scroll 1 lần duy nhất (tránh 300x layout reflow).
 async function loadFeedFromHistory() {
   const store = await chrome.storage.local.get({
     [HISTORY_KEY]: [],
     [FEED_CLEARED_KEY]: 0,
   });
   const clearedAt = store[FEED_CLEARED_KEY] || 0;
-  const items = (store[HISTORY_KEY] || []).filter(
+  const rawItems = (store[HISTORY_KEY] || []).filter(
     (it) => it.timestamp > clearedAt
   );
 
+  // Khử trùng theo sig từ cuối lên (giữ mục mới nhất) và chỉ lấy MAX_FEED_CARDS mục cuối
+  const seenSigs = new Set();
+  const deduped = [];
+  for (let i = rawItems.length - 1; i >= 0; i--) {
+    const it = rawItems[i];
+    if (!it) continue;
+    const sig = computeCardSig(it);
+    if (seenSigs.has(sig)) continue;
+    seenSigs.add(sig);
+    deduped.push(it);
+    if (deduped.length >= MAX_FEED_CARDS) break;
+  }
+  deduped.reverse();
+
   clearFeedUi();
-  items.forEach((it) => renderCard(it));
+  if (!deduped.length) return;
+
+  emptyStateEl.classList.add("hidden");
+  const frag = document.createDocumentFragment();
+  for (const it of deduped) {
+    frag.appendChild(createCardElement(it));
+  }
+  feedEl.appendChild(frag);
+  feedEl.scrollTop = feedEl.scrollHeight;
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +507,7 @@ function setLibraryTab(tab) {
 function renderLibraryList() {
   const query = (librarySearchInput.value || "").trim().toLowerCase();
   libraryListEl.innerHTML = "";
+  const frag = document.createDocumentFragment();
 
   if (activeLibraryTab === "glossary") {
     const filtered = cachedLibraryData.glossary.filter((g) => {
@@ -474,7 +527,8 @@ function renderLibraryList() {
       return;
     }
 
-    filtered.forEach((g) => {
+    const slice = filtered.slice(0, MAX_LIBRARY_RENDER);
+    slice.forEach((g) => {
       const row = el("div", "history-item");
       const hits = g.hitCount ? ` · 🔥 Dùng ${g.hitCount} lần` : "";
       row.innerHTML = `
@@ -517,8 +571,9 @@ function renderLibraryList() {
         )
       );
       row.appendChild(actions);
-      libraryListEl.appendChild(row);
+      frag.appendChild(row);
     });
+    libraryListEl.appendChild(frag);
   } else {
     const filtered = cachedLibraryData.tm.filter((t) => {
       if (!query) return true;
@@ -537,7 +592,8 @@ function renderLibraryList() {
       return;
     }
 
-    filtered.forEach((t) => {
+    const slice = filtered.slice(0, MAX_LIBRARY_RENDER);
+    slice.forEach((t) => {
       const row = el("div", "history-item");
       const modeTag =
         t.mode === "outgoing"
@@ -591,8 +647,9 @@ function renderLibraryList() {
         )
       );
       row.appendChild(actions);
-      libraryListEl.appendChild(row);
+      frag.appendChild(row);
     });
+    libraryListEl.appendChild(frag);
   }
 }
 
@@ -608,7 +665,10 @@ closeLibraryBtn?.addEventListener("click", () => {
 
 tabGlossaryBtn?.addEventListener("click", () => setLibraryTab("glossary"));
 tabTmBtn?.addEventListener("click", () => setLibraryTab("tm"));
-librarySearchInput?.addEventListener("input", () => renderLibraryList());
+librarySearchInput?.addEventListener("input", () => {
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => renderLibraryList(), 120);
+});
 
 addGlossaryBtn?.addEventListener("click", async () => {
   const source = glossarySourceInput.value.trim();
@@ -709,6 +769,7 @@ async function renderHistoryOverlay() {
     return;
   }
 
+  const frag = document.createDocumentFragment();
   [...items].reverse().forEach((item) => {
     const row = el("div", "history-item");
 
@@ -753,8 +814,9 @@ async function renderHistoryOverlay() {
       }, "danger")
     );
     row.appendChild(actions);
-    historyListEl.appendChild(row);
+    frag.appendChild(row);
   });
+  historyListEl.appendChild(frag);
 }
 
 historyBtn.addEventListener("click", async () => {
