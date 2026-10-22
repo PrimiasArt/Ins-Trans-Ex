@@ -634,8 +634,35 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 // ---------------------------------------------------------------------------
-// Gemini API (Tối ưu hóa siêu tốc, giới hạn token & Timeout chống treo)
+// Gemini API (Tối ưu hóa Thinking Config chuẩn theo từng dòng Model)
 // ---------------------------------------------------------------------------
+
+// Ghi nhớ trong RAM các model không hỗ trợ thinkingConfig để không bao giờ bị
+// lặp lại request lỗi HTTP 400 ở các lần dịch tiếp theo.
+const UNSUPPORTED_THINKING_MODELS = new Set();
+
+function getFastThinkingConfig(model) {
+  if (!model || UNSUPPORTED_THINKING_MODELS.has(model)) return null;
+  const m = String(model).toLowerCase();
+
+  // Gemini 2.5 Pro bắt buộc thinkingBudget tối thiểu = 128 (gửi 0 sẽ bị lỗi HTTP 400!)
+  if (m.includes("2.5-pro")) {
+    return { thinkingBudget: 128 };
+  }
+  // Gemini 2.5 Flash / Flash-Lite hỗ trợ tắt hoàn toàn thinking (thinkingBudget = 0)
+  if (m.includes("2.5-flash")) {
+    return { thinkingBudget: 0 };
+  }
+  // Gemini 3 / 3.1 / 3.5 / 3.8 Flash hỗ trợ thinkingLevel: "MINIMAL"
+  if (/gemini-3.*flash/i.test(m)) {
+    return { thinkingLevel: "MINIMAL" };
+  }
+  // Gemini 3 Pro / Gemini 4 hỗ trợ tối thiểu thinkingLevel: "LOW"
+  if (/gemini-3.*pro|gemini-4/i.test(m)) {
+    return { thinkingLevel: "LOW" };
+  }
+  return null;
+}
 
 async function callGemini({
   prompt,
@@ -646,7 +673,6 @@ async function callGemini({
   responseSchema,
   temperature = 0.2,
   fastMode = true,
-  maxOutputTokens = 512,
 }) {
   if (!apiKey) {
     throw new Error("Chưa cấu hình Gemini API key. Mở Settings để nhập.");
@@ -663,7 +689,6 @@ async function callGemini({
 
   const generationConfig = {
     temperature,
-    maxOutputTokens,
     responseMimeType: "application/json",
   };
 
@@ -671,9 +696,11 @@ async function callGemini({
     generationConfig.responseSchema = responseSchema;
   }
 
-  const isThinkingModel = /2\.5|thinking|gemini-3/i.test(model);
-  if (fastMode && isThinkingModel) {
-    generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  if (fastMode) {
+    const tc = getFastThinkingConfig(model);
+    if (tc) {
+      generationConfig.thinkingConfig = tc;
+    }
   }
 
   const body = {
@@ -689,7 +716,11 @@ async function callGemini({
 
   const fetchWithTimeout = async (reqBody) => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 45000);
     try {
       return await fetch(endpoint, {
         method: "POST",
@@ -700,6 +731,13 @@ async function callGemini({
         body: JSON.stringify(reqBody),
         signal: controller.signal,
       });
+    } catch (err) {
+      if (timedOut || err?.name === "AbortError") {
+        throw new Error(
+          `Model "${model}" phản hồi quá lâu (>45s). Hãy mở Cài đặt ⚙ và chuyển sang model dòng Flash (ví dụ: gemini-2.5-flash) để dịch nhanh tức thì!`
+        );
+      }
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -707,14 +745,24 @@ async function callGemini({
 
   let res = await fetchWithTimeout(body);
 
+  // Bước fallback 1: Nếu model từ chối thinkingConfig (HTTP 400), ghi nhớ vào RAM
+  // để các câu sau không gửi nữa, và thử lại mà VẪN GIỮ NGUYÊN systemInstruction + responseSchema!
+  if (!res.ok && res.status === 400 && generationConfig.thinkingConfig) {
+    UNSUPPORTED_THINKING_MODELS.add(model);
+    delete generationConfig.thinkingConfig;
+    res = await fetchWithTimeout(body);
+  }
+
+  // Bước fallback 2: Nếu model quá cũ không hỗ trợ systemInstruction/responseSchema,
+  // gộp systemInstruction vào đầu prompt để KHÔNG BAO GIỜ mất phong cách xưng hô!
   if (
     !res.ok &&
     res.status === 400 &&
-    (generationConfig.thinkingConfig ||
-      generationConfig.responseSchema ||
-      body.systemInstruction)
+    (generationConfig.responseSchema || body.systemInstruction)
   ) {
-    delete generationConfig.thinkingConfig;
+    if (systemInstruction) {
+      parts[0] = { text: `${systemInstruction}\n\n${prompt}` };
+    }
     delete generationConfig.responseSchema;
     delete body.systemInstruction;
     res = await fetchWithTimeout(body);
@@ -726,8 +774,14 @@ async function callGemini({
   }
 
   const data = await res.json();
+  const candidateParts = data?.candidates?.[0]?.content?.parts || [];
   const raw =
-    data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
+    candidateParts
+      .filter((p) => !p?.thought && typeof p?.text === "string")
+      .map((p) => p.text)
+      .join("") ||
+    candidateParts.map((p) => p?.text || "").join("") ||
+    "";
   return raw;
 }
 
@@ -874,8 +928,6 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
     required: requiredFields,
   };
 
-  const maxOut = cleanText.length < 250 ? (includePhonetics ? 512 : 320) : 1024;
-
   const raw = await callGemini({
     prompt: promptLines.join("\n\n"),
     apiKey: settings.apiKey,
@@ -884,7 +936,6 @@ async function translateWithGemini({ text, targetLang, mode, settings }) {
     responseSchema,
     temperature: 0.2,
     fastMode: settings.fastMode !== false,
-    maxOutputTokens: maxOut,
   });
 
   const latencyMs = Math.round(performance.now() - startTime);
@@ -932,7 +983,6 @@ async function translateImageWithGemini({ image, targetLang, settings }) {
     image,
     temperature: 0.2,
     fastMode: settings.fastMode !== false,
-    maxOutputTokens: 1024,
   });
 
   const latencyMs = Math.round(performance.now() - startTime);
@@ -976,7 +1026,6 @@ async function getStyleVariants({ text, targetLang, settings }) {
     responseSchema,
     temperature: 0.5,
     fastMode: settings.fastMode !== false,
-    maxOutputTokens: 600,
   });
 
   let parsed;
@@ -1038,7 +1087,6 @@ async function suggestReplies({
     responseSchema,
     temperature: 0.4,
     fastMode: settings.fastMode !== false,
-    maxOutputTokens: 700,
   });
 
   let parsed;
